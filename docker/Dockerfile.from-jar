@@ -1,0 +1,22 @@
+FROM eclipse-temurin:17-jre-jammy
+RUN useradd -u 10001 -r -s /usr/sbin/nologin app \
+ && mkdir -p /opt/app \
+ && chown -R app:app /opt/app
+WORKDIR /opt/app
+
+# Expect the workflow to provide app.jar in build context
+COPY app.jar app.jar
+
+USER app
+EXPOSE 8080
+ENV JAVA_OPTS="-XX:+UseContainerSupport -XX:MaxRAMPercentage=75"
+ENTRYPOINT ["sh","-c","java $JAVA_OPTS -jar app.jar"]
+
+# Traceability
+ARG BUILD_TS
+ARG VCS_REF
+ARG REPO_URL
+LABEL org.opencontainers.image.created="${BUILD_TS}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.source="${REPO_URL}" \
+      org.opencontainers.image.title="spring-petclinic"

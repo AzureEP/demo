@@ -1,0 +1,87 @@
+name: 01 — Build & Publish JAR
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-publish-jar:
+    runs-on: ubuntu-latest
+    env:
+      JF_URL:        ${{ vars.JF_URL }}
+      MAVEN_REPO:    ${{ vars.MAVEN_REPO }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Set up JDK 17 and Maven server credentials
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: 'maven'
+          server-id: artifactory
+          server-username: ${{ secrets.JFROG_USER }}
+          server-password: ${{ secrets.JFROG_TOKEN }}
+
+      - name: Derive build metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA_FULL="${GITHUB_SHA}"
+          SHA_SHORT="${GITHUB_SHA::7}"
+          CURR_VER=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)
+          BASE_VER="${CURR_VER%-SNAPSHOT}"
+          NEW_VER="${BASE_VER}-g${SHA_SHORT}-SNAPSHOT"
+          echo "sha_short=${SHA_SHORT}" >> "$GITHUB_OUTPUT"
+          echo "new_version=${NEW_VER}" >> "$GITHUB_OUTPUT"
+          echo "Setting version to: ${NEW_VER}"
+
+      - name: Set project version (g<sha>-SNAPSHOT)
+        run: mvn -B -ntp -DgenerateBackupPoms=false versions:set -DnewVersion="${{ steps.meta.outputs.new_version }}"
+
+      # --- Quality checks (non-blocking) ---
+      - name: Checkstyle (non-blocking)
+        run: mvn -B -ntp checkstyle:check || true
+        continue-on-error: true
+
+      - name: SpotBugs (non-blocking)
+        run: mvn -B -ntp com.github.spotbugs:spotbugs-maven-plugin:spotbugs || true
+        continue-on-error: true
+
+      # --- Tests (run existing tests; don't write new) ---
+      - name: Test
+        run: mvn -B -ntp -DskipITs verify
+
+      # --- Package JAR ---
+      - name: Package
+        run: mvn -B -ntp -DskipITs package
+
+      # --- Deploy JAR to Artifactory (no pom changes needed) ---
+      - name: Deploy to Artifactory
+        env:
+          ALT_REPO: artifactory::default::${{ env.JF_URL }}/artifactory/${{ env.MAVEN_REPO }}
+        run: mvn -B -ntp -DskipITs -DskipTests=true -DaltDeploymentRepository="${ALT_REPO}" deploy
+
+      # Upload the exact JAR as workflow artifact so #02 can inject it
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jar-${{ github.sha }}
+          path: |
+            target/*.jar
+            target/*.pom
+          if-no-files-found: error
+
+      - name: Summary
+        run: |
+          echo "### JAR published" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Version: \`${{ steps.meta.outputs.new_version }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Artifact: \`jar-${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Maven repo: \`${{ env.MAVEN_REPO }}\` at \`${{ env.JF_URL }}\`" >> "$GITHUB_STEP_SUMMARY"

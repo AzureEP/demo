@@ -1,0 +1,102 @@
+name: 02 — Docker from JAR (dev)
+
+on:
+  workflow_run:
+    workflows: ["01 — Build & Publish JAR"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "Commit SHA to package (defaults to latest on main)"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  package-docker:
+    runs-on: ubuntu-latest
+
+    env:
+      JF_URL:              ${{ vars.JF_URL }}
+      JF_DOCKER_REGISTRY:  ${{ vars.JF_DOCKER_REGISTRY }}
+      DOCKER_DEV_REPO:     ${{ vars.DOCKER_DEV_REPO }}
+      IMAGE_NAME:          ${{ vars.IMAGE_NAME }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Resolve source commit and artifact name
+        id: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.inputs.commit || '' }}" ]; then
+            SHA="${{ github.event.inputs.commit }}"
+          else
+            SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
+          fi
+          SHORT="${SHA::7}"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "short=${SHORT}" >> "$GITHUB_OUTPUT"
+          echo "Artifact expected: jar-${SHA}"
+
+      - name: Download JAR artifact from workflow #01
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: 01 — Build & Publish JAR
+          run_id: ${{ github.event.workflow_run.id }}
+          name: jar-${{ steps.src.outputs.sha }}
+          path: ./inbox
+
+      - name: List downloaded files
+        run: ls -la ./inbox
+
+      - name: Prepare app.jar
+        run: |
+          set -euo pipefail
+          JAR=$(ls -1 ./inbox/*.jar | head -n1)
+          cp "$JAR" app.jar
+          ls -la app.jar
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to JFrog Docker registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.JF_DOCKER_REGISTRY }}
+          username: ${{ secrets.JFROG_USER }}
+          password: ${{ secrets.JFROG_TOKEN }}
+
+      - name: Build & push image (dev) — from provided JAR
+        env:
+          TAG1: ${{ env.JF_DOCKER_REGISTRY }}/${{ env.DOCKER_DEV_REPO }}/${{ env.IMAGE_NAME }}:git-${{ steps.src.outputs.short }}
+          TAG2: ${{ env.JF_DOCKER_REGISTRY }}/${{ env.DOCKER_DEV_REPO }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-latest
+        run: |
+          set -euo pipefail
+          echo "Using tags:"
+          echo " - $TAG1"
+          echo " - $TAG2"
+          docker buildx build \
+            --platform linux/amd64 \
+            -f docker/Dockerfile.from-jar \
+            --build-arg BUILD_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --build-arg VCS_REF="${{ steps.src.outputs.sha }}" \
+            --build-arg REPO_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            -t "$TAG1" -t "$TAG2" \
+            --push .
+
+      # Optional: add non-blocking image scan later (e.g., Trivy) with continue-on-error: true
+
+      - name: Summary
+        run: |
+          {
+            echo "### Dev image built from JAR"
+            echo "- Commit: \`${{ steps.src.outputs.sha }}\`"
+            echo "- Tags:"
+            echo "  - \`${{ env.JF_DOCKER_REGISTRY }}/${{ env.DOCKER_DEV_REPO }}/${{ env.IMAGE_NAME }}:git-${{ steps.src.outputs.short }}\`"
+            echo "  - \`${{ env.JF_DOCKER_REGISTRY }}/${{ env.DOCKER_DEV_REPO }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-latest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
