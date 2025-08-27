@@ -1,8 +1,20 @@
 # .github/workflows/docker-promote.yml
-# Promote image from dev → prod in JFrog Artifactory (no rebuild), verify digest parity,
-# and create a GitHub Release (v<version>) that maps release ↔ commit ↔ digests.
+# Promote image from Artifactory dev → prod (no rebuild), verify digest parity,
+# and persist traceability in Artifactory (properties + optional JSON in a Generic repo).
+#
+# Repo variables (Settings → Variables):
+#   JF_URL               e.g., https://chirag095.jfrog.io
+#   JF_DOCKER_REGISTRY   e.g., chirag095.jfrog.io
+#   DOCKER_DEV_REPO      e.g., petclinic-demo
+#   DOCKER_PROD_REPO     e.g., petclinic-prd
+#   IMAGE_NAME           e.g., spring-petclinic
+#   META_REPO            (optional) e.g., petclinic-meta  # Generic repo for mapping JSON
+#
+# Repo secrets (Settings → Secrets and variables → Actions → Secrets):
+#   JFROG_USER
+#   JFROG_TOKEN
 
-name: Docker — Promote to prod
+name: Docker — Promote to prod (Artifactory-native)
 
 on:
   workflow_dispatch:
@@ -15,31 +27,25 @@ on:
         required: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   promote:
     runs-on: ubuntu-latest
-    # Needed for creating the GitHub Release
-    permissions:
-      contents: write
-    environment:
-      name: prod   # Protect this env in GitHub → Settings → Environments → prod
+    # (Optional) gate with environment approvals:
+    # environment:
+    #   name: prod
 
     env:
-      # Set these as Repository Variables (Settings → Variables):
-      #   JF_URL=https://chirag095.jfrog.io
-      #   JF_DOCKER_REGISTRY=chirag095.jfrog.io
-      #   DOCKER_DEV_REPO=petclinic-demo
-      #   DOCKER_PROD_REPO=petclinic-prd
       JF_URL:              ${{ vars.JF_URL }}
       JF_DOCKER_REGISTRY:  ${{ vars.JF_DOCKER_REGISTRY }}
       DOCKER_DEV_REPO:     ${{ vars.DOCKER_DEV_REPO }}
       DOCKER_PROD_REPO:    ${{ vars.DOCKER_PROD_REPO }}
-      IMAGE_NAME:          spring-petclinic
+      IMAGE_NAME:          ${{ vars.IMAGE_NAME }}
+      META_REPO:           ${{ vars.META_REPO }}
 
     steps:
-      - name: Checkout (to resolve full commit SHA)
+      - name: Checkout (to resolve full commit SHA for mapping)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -50,24 +56,22 @@ jobs:
         run: |
           set -euo pipefail
           SRC="${{ github.event.inputs.sourceTag }}"
-          TGT="${{ github.event.inputs.targetTag }}"
-          if [ -z "$TGT" ]; then TGT="$SRC"; fi
+          TGT_IN="${{ github.event.inputs.targetTag }}"
+          if [ -z "$TGT_IN" ]; then TGT_IN="$SRC"; fi
 
           SHORT="${SRC#git-}"
-          # Resolve to full commit SHA in this repo (fallback to SHORT if not found)
           if git rev-parse --verify "${SHORT}^{commit}" >/dev/null 2>&1; then
             FULL=$(git rev-parse --verify "${SHORT}^{commit}")
           else
             FULL="$SHORT"
           fi
 
-          echo "src=$SRC"            >> "$GITHUB_OUTPUT"
-          echo "tgt=$TGT"            >> "$GITHUB_OUTPUT"
-          echo "short_commit=$SHORT" >> "$GITHUB_OUTPUT"
-          echo "full_commit=$FULL"   >> "$GITHUB_OUTPUT"
+          echo "src=$SRC"          >> "$GITHUB_OUTPUT"
+          echo "tgt=$TGT_IN"       >> "$GITHUB_OUTPUT"
+          echo "full_commit=$FULL" >> "$GITHUB_OUTPUT"
 
           echo "Source tag : $SRC"
-          echo "Target tag : $TGT"
+          echo "Target tag : $TGT_IN"
           echo "Full commit: $FULL"
 
       - name: Promote via Artifactory Docker Promote API (copy layers; no rebuild)
@@ -76,7 +80,6 @@ jobs:
           set -euo pipefail
           SRC="${{ steps.vars.outputs.src }}"
           TGT="${{ steps.vars.outputs.tgt }}"
-
           URL="${{ env.JF_URL }}/artifactory/api/docker/${{ env.DOCKER_DEV_REPO }}/v2/promote"
           JSON=$(printf '{"targetRepo":"%s","dockerRepository":"%s","tag":"%s","targetTag":"%s","copy":true}' \
                  "${{ env.DOCKER_PROD_REPO }}" "${{ env.IMAGE_NAME }}" "$SRC" "$TGT")
@@ -95,26 +98,20 @@ jobs:
           NAME: ${{ env.IMAGE_NAME }}
         run: |
           set -euo pipefail
-
           SRC="${{ steps.vars.outputs.src }}"
           TGT="${{ steps.vars.outputs.tgt }}"
           DEV_REPO="${{ env.DOCKER_DEV_REPO }}"
           PRD_REPO="${{ env.DOCKER_PROD_REPO }}"
           NAME="${NAME}"
 
-          # Registry endpoints (preferred for digest header)
           DEV_REG_URL="https://${{ env.JF_DOCKER_REGISTRY }}/v2/${DEV_REPO}/${NAME}/manifests/${SRC}"
           PRD_REG_URL="https://${{ env.JF_DOCKER_REGISTRY }}/v2/${PRD_REPO}/${NAME}/manifests/${TGT}"
-
-          # Artifactory API endpoints (secondary)
           DEV_API_URL="${{ env.JF_URL }}/artifactory/api/docker/${DEV_REPO}/v2/${NAME}/manifests/${SRC}"
           PRD_API_URL="${{ env.JF_URL }}/artifactory/api/docker/${PRD_REPO}/v2/${NAME}/manifests/${TGT}"
 
-          # Try to fetch Docker-Content-Digest header with correct Accept types
           get_digest() {
             local url="$1"
-            local hdrs=""
-            local val=""
+            local hdrs val
             for accept in \
               'application/vnd.docker.distribution.manifest.v2+json' \
               'application/vnd.oci.image.manifest.v1+json' \
@@ -122,16 +119,12 @@ jobs:
             do
               hdrs=$(curl -sSI -u "${{ secrets.JFROG_USER }}:${{ secrets.JFROG_TOKEN }}" -H "Accept: ${accept}" "$url" || true)
               val=$(printf '%s' "$hdrs" | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' | tail -n1)
-              if [ -n "$val" ]; then
-                echo "$val"
-                return 0
-              fi
+              [ -n "$val" ] && { echo "$val"; return 0; }
             done
             echo ""
             return 1
           }
 
-          # Fallback: compute digest by hashing the manifest bytes we GET
           get_digest_by_hash() {
             local url="$1"
             local body="/tmp/manifest.$RANDOM.json"
@@ -148,27 +141,21 @@ jobs:
             return 1
           }
 
-          # Dev digest: try registry → API → hash
           DEV_DIG=""
           for url in "$DEV_REG_URL" "$DEV_API_URL"; do
             DEV_DIG=$(get_digest "$url") && [ -n "$DEV_DIG" ] && break || true
           done
-          if [ -z "$DEV_DIG" ]; then
-            for url in "$DEV_REG_URL" "$DEV_API_URL"; do
-              DEV_DIG=$(get_digest_by_hash "$url") && [ -n "$DEV_DIG" ] && break || true
-            done
-          fi
+          [ -n "$DEV_DIG" ] || for url in "$DEV_REG_URL" "$DEV_API_URL"; do
+            DEV_DIG=$(get_digest_by_hash "$url") && [ -n "$DEV_DIG" ] && break || true
+          done
 
-          # Prod digest: try registry → API → hash
           PRD_DIG=""
           for url in "$PRD_REG_URL" "$PRD_API_URL"; do
             PRD_DIG=$(get_digest "$url") && [ -n "$PRD_DIG" ] && break || true
           done
-          if [ -z "$PRD_DIG" ]; then
-            for url in "$PRD_REG_URL" "$PRD_API_URL"; do
-              PRD_DIG=$(get_digest_by_hash "$url") && [ -n "$PRD_DIG" ] && break || true
-            done
-          fi
+          [ -n "$PRD_DIG" ] || for url in "$PRD_REG_URL" "$PRD_API_URL"; do
+            PRD_DIG=$(get_digest_by_hash "$url") && [ -n "$PRD_DIG" ] && break || true
+          done
 
           echo "Dev  digest: $DEV_DIG"
           echo "Prod digest: $PRD_DIG"
@@ -180,7 +167,33 @@ jobs:
           echo "prod_digest=$PRD_DIG"  >> "$GITHUB_OUTPUT"
           echo "Promotion OK — digests match ✅"
 
-      - name: Create release mapping JSON
+      - name: Persist traceability as Artifactory properties (dev & prod manifests)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="${{ steps.vars.outputs.src }}"
+          TGT="${{ steps.vars.outputs.tgt }}"
+          FULL="${{ steps.vars.outputs.full_commit }}"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          DIG="${{ steps.digests.outputs.prod_digest }}"  # same post-promotion
+
+          # Docker manifests path: <image>/<tag>/manifest.json
+          DEV_MAN_PATH="${{ env.IMAGE_NAME }}/${SRC}/manifest.json"
+          PRD_MAN_PATH="${{ env.IMAGE_NAME }}/${TGT}/manifest.json"
+
+          set_prop () {
+            local repo="$1"; local path="$2"
+            local props="git.commit=${FULL};release.version=${TGT};dev.tag=${SRC};prod.tag=${TGT};docker.digest=${DIG};ci.run=${RUN_URL}"
+            local url="${{ env.JF_URL }}/artifactory/api/storage/${repo}/${path}?properties=${props}"
+            echo "PUT $url"
+            curl -sS -u "${{ secrets.JFROG_USER }}:${{ secrets.JFROG_TOKEN }}" -X PUT "$url" -o /tmp/props.json
+            echo "Response:"; cat /tmp/props.json
+          }
+
+          set_prop "${{ env.DOCKER_DEV_REPO }}"  "$DEV_MAN_PATH"
+          set_prop "${{ env.DOCKER_PROD_REPO }}" "$PRD_MAN_PATH"
+
+      - name: Create release-mapping.json (optional upload to Generic repo)
         id: mapping
         shell: bash
         run: |
@@ -188,12 +201,11 @@ jobs:
           SRC="${{ steps.vars.outputs.src }}"
           TGT="${{ steps.vars.outputs.tgt }}"
           FULL="${{ steps.vars.outputs.full_commit }}"
-          IMG="${{ env.IMAGE_NAME }}"
           DEV="${{ env.DOCKER_DEV_REPO }}"
           PRD="${{ env.DOCKER_PROD_REPO }}"
+          IMG="${{ env.IMAGE_NAME }}"
           DEV_DIG="${{ steps.digests.outputs.dev_digest }}"
           PRD_DIG="${{ steps.digests.outputs.prod_digest }}"
-
           printf '%s\n' "{
             \"version\": \"${TGT}\",
             \"commit\":  \"${FULL}\",
@@ -203,25 +215,30 @@ jobs:
             \"ci_run\": \"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\",
             \"created\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
           }" > release-mapping.json
-          echo "map_file=release-mapping.json" >> "$GITHUB_OUTPUT"
 
-      - name: Create GitHub Release (v<version> → commit)
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ steps.vars.outputs.tgt }}
-          target_commitish: ${{ steps.vars.outputs.full_commit }}
-          name: Release ${{ steps.vars.outputs.tgt }}
-          body: |
-            Release **${{ steps.vars.outputs.tgt }}**
-            - Commit: `${{ steps.vars.outputs.full_commit }}`
-            - Dev tag: `${{ env.DOCKER_DEV_REPO }}:${{ steps.vars.outputs.src }}`
-            - Prod tag: `${{ env.DOCKER_PROD_REPO }}:${{ steps.vars.outputs.tgt }}`
-            - Digest: `${{ steps.digests.outputs.prod_digest }}`
-          files: |
-            ${{ steps.mapping.outputs.map_file }}
+          if [ -n "${{ env.META_REPO }}" ]; then
+            DEST="${{ env.JF_URL }}/artifactory/${{ env.META_REPO }}/${IMG}/releases/${TGT}.json"
+            echo "Uploading mapping to ${DEST}"
+            curl -sS -u "${{ secrets.JFROG_USER }}:${{ secrets.JFROG_TOKEN }}" -T release-mapping.json "$DEST" -o /tmp/meta.json || true
+            echo "Upload response:"; cat /tmp/meta.json || true
+            # Optional: add properties to JSON for quick searches
+            PROP_URL="${DEST/\/artifactory\//\/artifactory\/api\/storage\/}?properties=git.commit=${FULL};release.version=${TGT};docker.digest=${PRD_DIG};ci.run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "PUT $PROP_URL"
+            curl -sS -u "${{ secrets.JFROG_USER }}:${{ secrets.JFROG_TOKEN }}" -X PUT "$PROP_URL" -o /tmp/meta-prop.json || true
+            echo "Prop response:"; cat /tmp/meta-prop.json || true
+          else
+            echo "META_REPO not set; skipping JSON upload (properties still saved on manifests)."
+          fi
 
-      - name: Upload mapping as workflow artifact (optional duplicate)
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-mapping-${{ steps.vars.outputs.tgt }}
-          path: ${{ steps.mapping.outputs.map_file }}
+      - name: Summary
+        run: |
+          {
+            echo "### Promotion summary"
+            echo "- Dev repo: \`${{ env.DOCKER_DEV_REPO }}\`  tag: \`${{ steps.vars.outputs.src }}\`"
+            echo "- Prod repo: \`${{ env.DOCKER_PROD_REPO }}\` tag: \`${{ steps.vars.outputs.tgt }}\`"
+            echo "- Digest: \`${{ steps.digests.outputs.prod_digest }}\`"
+            echo "- Traceability: properties set on dev/prod manifests in Artifactory"
+            if [ -n "${{ env.META_REPO }}" ]; then
+              echo "- Mapping JSON uploaded to: \`${{ env.META_REPO }}/${{ env.IMAGE_NAME }}/releases/${{ steps.vars.outputs.tgt }}.json\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
