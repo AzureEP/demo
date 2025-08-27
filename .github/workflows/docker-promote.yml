@@ -1,3 +1,7 @@
+# .github/workflows/docker-promote.yml
+# Promote image from dev → prod in JFrog Artifactory (no rebuild), verify digest parity,
+# and create a GitHub Release (v<version>) that maps release ↔ commit ↔ digests.
+
 name: Docker — Promote to prod
 
 on:
@@ -7,7 +11,7 @@ on:
         description: "Dev tag to promote (e.g., git-104c263)"
         required: true
       targetTag:
-        description: "Prod tag (release version, e.g., 1.2.3). Default: same as sourceTag"
+        description: "Prod tag (release version, e.g., 1.2.3). Leave blank to reuse sourceTag"
         required: false
 
 permissions:
@@ -16,119 +20,145 @@ permissions:
 jobs:
   promote:
     runs-on: ubuntu-latest
+    # We need write here to create the GitHub Release
+    permissions:
+      contents: write
     environment:
-      name: prod   # Set approvals in GitHub → Settings → Environments → prod
+      name: prod   # Protect this env in GitHub → Settings → Environments → prod
 
     env:
-      # Variables
-      JF_URL:              ${{ vars.JF_URL }}                 # https://chirag095.jfrog.io
-      JF_DOCKER_REGISTRY:  ${{ vars.JF_DOCKER_REGISTRY }}     # chirag095.jfrog.io
-      DOCKER_DEV_REPO:     ${{ vars.DOCKER_DEV_REPO }}        # docker-petclinic-dev
-      DOCKER_PROD_REPO:    ${{ vars.DOCKER_PROD_REPO }}       # docker-petclinic-prod
+      # Set these as Repository Variables (Settings → Variables):
+      #   JF_URL=https://chirag095.jfrog.io
+      #   JF_DOCKER_REGISTRY=chirag095.jfrog.io
+      #   DOCKER_DEV_REPO=docker-petclinic-dev
+      #   DOCKER_PROD_REPO=docker-petclinic-prod
+      JF_URL:              ${{ vars.JF_URL }}
+      JF_DOCKER_REGISTRY:  ${{ vars.JF_DOCKER_REGISTRY }}
+      DOCKER_DEV_REPO:     ${{ vars.DOCKER_DEV_REPO }}
+      DOCKER_PROD_REPO:    ${{ vars.DOCKER_PROD_REPO }}
       IMAGE_NAME:          spring-petclinic
 
     steps:
-      - name: Checkout (to resolve commit SHA)
+      - name: Checkout (to resolve full commit SHA)
         uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
 
-      - name: Promote via Artifactory Docker Promote API
-        id: promote
+      - name: Compute variables (source/target tags, commit)
+        id: vars
+        shell: bash
         run: |
           set -euo pipefail
           SRC="${{ github.event.inputs.sourceTag }}"
-          TGT="${{ github.event.inputs.targetTag || github.event.inputs.sourceTag }}"
-          BODY=$(cat <<JSON
-          {
-            "targetRepo": "${{ env.DOCKER_PROD_REPO }}",
-            "dockerRepository": "${{ env.IMAGE_NAME }}",
-            "tag": "${SRC}",
-            "targetTag": "${TGT}",
-            "copy": true
-          }
-JSON
-)
+          TGT="${{ github.event.inputs.targetTag }}"
+          if [ -z "$TGT" ]; then TGT="$SRC"; fi
+
+          SHORT="${SRC#git-}"
+          # Resolve to full commit SHA in this repo (fallback to SHORT if not found)
+          if git rev-parse --verify "${SHORT}^{commit}" >/dev/null 2>&1; then
+            FULL=$(git rev-parse --verify "${SHORT}^{commit}")
+          else
+            FULL="$SHORT"
+          fi
+
+          echo "src=$SRC"           >> "$GITHUB_OUTPUT"
+          echo "tgt=$TGT"           >> "$GITHUB_OUTPUT"
+          echo "short_commit=$SHORT" >> "$GITHUB_OUTPUT"
+          echo "full_commit=$FULL"   >> "$GITHUB_OUTPUT"
+
+          echo "Source tag : $SRC"
+          echo "Target tag : $TGT"
+          echo "Full commit: $FULL"
+
+      - name: Promote via Artifactory Docker Promote API (copy layers; no rebuild)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="${{ steps.vars.outputs.src }}"
+          TGT="${{ steps.vars.outputs.tgt }}"
+
           URL="${{ env.JF_URL }}/artifactory/api/docker/${{ env.DOCKER_DEV_REPO }}/v2/promote"
+          JSON=$(printf '{"targetRepo":"%s","dockerRepository":"%s","tag":"%s","targetTag":"%s","copy":true}' \
+                 "${{ env.DOCKER_PROD_REPO }}" "${{ env.IMAGE_NAME }}" "$SRC" "$TGT")
           echo "POST $URL"
+          echo "$JSON"
           curl -sS -u "${{ secrets.JFROG_USER }}:${{ secrets.JFROG_TOKEN }}" \
                -H "Content-Type: application/json" \
-               -d "$BODY" \
-               "$URL" -o /tmp/resp.json
-          echo "Response:"; cat /tmp/resp.json
+               -d "$JSON" \
+               "$URL" -o /tmp/promote.json
+          echo "Response:"; cat /tmp/promote.json
 
       - name: Verify digest parity (dev vs prod)
         id: digests
+        shell: bash
         run: |
           set -euo pipefail
-          SRC="${{ github.event.inputs.sourceTag }}"
-          TGT="${{ github.event.inputs.targetTag || github.event.inputs.sourceTag }}"
-          dev_url="${{ env.JF_URL }}/artifactory/api/docker/${{ env.DOCKER_DEV_REPO }}/v2/${{ env.IMAGE_NAME }}/manifests/${SRC}"
-          prod_url="${{ env.JF_URL }}/artifactory/api/docker/${{ env.DOCKER_PROD_REPO }}/v2/${{ env.IMAGE_NAME }}/manifests/${TGT}"
+          SRC="${{ steps.vars.outputs.src }}"
+          TGT="${{ steps.vars.outputs.tgt }}"
+          NAME="${{ env.IMAGE_NAME }}"
+
+          dev_url="${{ env.JF_URL }}/artifactory/api/docker/${{ env.DOCKER_DEV_REPO }}/v2/${NAME}/manifests/${SRC}"
+          prod_url="${{ env.JF_URL }}/artifactory/api/docker/${{ env.DOCKER_PROD_REPO }}/v2/${NAME}/manifests/${TGT}"
+
           dev_hdrs=$(curl -sSI -u "${{ secrets.JFROG_USER }}:${{ secrets.JFROG_TOKEN }}" "$dev_url")
           prod_hdrs=$(curl -sSI -u "${{ secrets.JFROG_USER }}:${{ secrets.JFROG_TOKEN }}" "$prod_url")
+
           dev_digest=$(echo "$dev_hdrs"  | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' | tail -n1)
           prod_digest=$(echo "$prod_hdrs" | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' | tail -n1)
-          echo "dev_digest=${dev_digest}"   >> "$GITHUB_OUTPUT"
-          echo "prod_digest=${prod_digest}" >> "$GITHUB_OUTPUT"
+
           echo "Dev  digest: $dev_digest"
           echo "Prod digest: $prod_digest"
-          if [ -z "$dev_digest" ] || [ -z "$prod_digest" ]; then
-            echo "::error::Could not fetch Docker-Content-Digest headers."; exit 1
-          fi
-          if [ "$dev_digest" != "$prod_digest" ]; then
-            echo "::error::Digest mismatch after promotion."; exit 1
-          fi
+
+          [ -n "$dev_digest" ]  || { echo "::error::Missing dev digest";  exit 1; }
+          [ -n "$prod_digest" ] || { echo "::error::Missing prod digest"; exit 1; }
+          [ "$dev_digest" = "$prod_digest" ] || { echo "::error::Digest mismatch after promotion"; exit 1; }
+
+          echo "dev_digest=$dev_digest"   >> "$GITHUB_OUTPUT"
+          echo "prod_digest=$prod_digest" >> "$GITHUB_OUTPUT"
           echo "Promotion OK — digests match ✅"
 
       - name: Create release mapping JSON
         id: mapping
         shell: bash
-        env:
-          SRC_TAG:   ${{ github.event.inputs.sourceTag }}      # e.g., git-104c263
-          TGT_TAG:   ${{ github.event.inputs.targetTag || github.event.inputs.sourceTag }}  # e.g., 1.2.3
-          IMAGE:     ${{ env.IMAGE_NAME }}
-          DEV_REPO:  ${{ env.DOCKER_DEV_REPO }}
-          PROD_REPO: ${{ env.DOCKER_PROD_REPO }}
-          JF_URL:    ${{ env.JF_URL }}
         run: |
           set -euo pipefail
-          # Extract short commit from sourceTag (expects git-<shortsha>)
-          SHORT="${SRC_TAG#git-}"
-          # Resolve to full commit in this repo
-          FULL=$(git rev-parse --verify "${SHORT}^{commit}") || FULL="$SHORT"
-          # Digests from previous step
+          SRC="${{ steps.vars.outputs.src }}"
+          TGT="${{ steps.vars.outputs.tgt }}"
+          FULL="${{ steps.vars.outputs.full_commit }}"
+          IMG="${{ env.IMAGE_NAME }}"
+          DEV="${{ env.DOCKER_DEV_REPO }}"
+          PRD="${{ env.DOCKER_PROD_REPO }}"
           DEV_DIG="${{ steps.digests.outputs.dev_digest }}"
           PRD_DIG="${{ steps.digests.outputs.prod_digest }}"
+
           printf '%s\n' "{
-            \"version\": \"${TGT_TAG}\",
+            \"version\": \"${TGT}\",
             \"commit\":  \"${FULL}\",
-            \"image\":   \"${IMAGE}\",
-            \"dev\":  { \"repo\": \"${DEV_REPO}\",  \"tag\": \"${SRC_TAG}\", \"digest\": \"${DEV_DIG}\" },
-            \"prod\": { \"repo\": \"${PROD_REPO}\", \"tag\": \"${TGT_TAG}\", \"digest\": \"${PRD_DIG}\" },
+            \"image\":   \"${IMG}\",
+            \"dev\":  { \"repo\": \"${DEV}\",  \"tag\": \"${SRC}\", \"digest\": \"${DEV_DIG}\" },
+            \"prod\": { \"repo\": \"${PRD}\", \"tag\": \"${TGT}\", \"digest\": \"${PRD_DIG}\" },
             \"ci_run\": \"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\",
             \"created\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
           }" > release-mapping.json
-          echo "full_commit=${FULL}" >> "$GITHUB_OUTPUT"
+          echo "map_file=release-mapping.json" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release (v<version> → commit)
-        permissions:
-          contents: write
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ github.event.inputs.targetTag || github.event.inputs.sourceTag }}
-          target_commitish: ${{ steps.mapping.outputs.full_commit }}
-          name: Release ${{ github.event.inputs.targetTag || github.event.inputs.sourceTag }}
+          tag_name: v${{ steps.vars.outputs.tgt }}
+          target_commitish: ${{ steps.vars.outputs.full_commit }}
+          name: Release ${{ steps.vars.outputs.tgt }}
           body: |
-            Release **${{ github.event.inputs.targetTag || github.event.inputs.sourceTag }}**
-            - Commit: `${{ steps.mapping.outputs.full_commit }}`
-            - Dev tag: `${{ env.DOCKER_DEV_REPO }}:${{ github.event.inputs.sourceTag }}`
-            - Prod tag: `${{ env.DOCKER_PROD_REPO }}:${{ github.event.inputs.targetTag || github.event.inputs.sourceTag }}`
+            Release **${{ steps.vars.outputs.tgt }}**
+            - Commit: `${{ steps.vars.outputs.full_commit }}`
+            - Dev tag: `${{ env.DOCKER_DEV_REPO }}:${{ steps.vars.outputs.src }}`
+            - Prod tag: `${{ env.DOCKER_PROD_REPO }}:${{ steps.vars.outputs.tgt }}`
             - Digest: `${{ steps.digests.outputs.prod_digest }}`
           files: |
-            release-mapping.json
+            ${{ steps.mapping.outputs.map_file }}
 
       - name: Upload mapping as workflow artifact (optional duplicate)
         uses: actions/upload-artifact@v4
         with:
-          name: release-mapping-${{ github.event.inputs.targetTag || github.event.inputs.sourceTag }}
-          path: release-mapping.json
+          name: release-mapping-${{ steps.vars.outputs.tgt }}
+          path: ${{ steps.mapping.outputs.map_file }}
