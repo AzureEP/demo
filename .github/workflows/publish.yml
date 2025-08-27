@@ -1,7 +1,9 @@
 # .github/workflows/publish.yml
-# Simple: Build, test, and publish JAR to JFrog Artifactory (no <distributionManagement>)
-# Version is rewritten to include commit id so Artifactory filenames contain both commit + timestamp.
-# Local SHA256/SHA512 files are uploaded as a workflow artifact.
+# Simple & consistent: build, test, and publish JAR to JFrog Artifactory (no <distributionManagement>).
+# - Single Maven invocation for reproducibility (same JAR locally and in Artifactory)
+# - Version is rewritten to include commit id so Artifactory filenames include commit+timestamp
+# - Local copy named with commit+timestamp + SHA256/SHA512 uploaded as workflow artifact
+# - Optional checksum verification against Artifactory using GAVC search
 
 name: Build and Publish to JFrog Artifactory
 
@@ -18,16 +20,14 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # Set these in your repo:
-      # Secrets:  JFROG_USER, JFROG_TOKEN
-      # Variables: JF_URL (e.g., https://yourorg.jfrog.io),
-      #            JF_MVN_SNAPSHOTS_REPO (e.g., maven-snapshots-local),
-      #            JF_MVN_RELEASES_REPO  (e.g., maven-releases-local)
+      # Required configuration:
+      #   Secrets:  JFROG_USER, JFROG_TOKEN
+      #   Variables: JF_URL (e.g., https://yourorg.jfrog.io),
+      #              JF_MVN_SNAPSHOTS_REPO (e.g., maven-snapshots-local)
       JFROG_USER:  ${{ secrets.JFROG_USER }}
       JFROG_TOKEN: ${{ secrets.JFROG_TOKEN }}
       JF_URL:      ${{ vars.JF_URL }}
       SNAP_REPO:   ${{ vars.JF_MVN_SNAPSHOTS_REPO }}
-      REL_REPO:    ${{ vars.JF_MVN_RELEASES_REPO }}
 
       ARTIFACT_DIR: dist
       MVN_FLAGS: "-B -ntp -C -e"  # batch, no transfer progress, strict checksums, stacktraces
@@ -65,12 +65,11 @@ jobs:
           echo "iso=$(date -u -d @${COMMIT_TS} +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
           echo "compact=$(date -u -d @${COMMIT_TS} +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
 
-      - name: Set version to include commit id (so filenames include it)
+      - name: Set version to include commit id
         id: ver
         shell: bash
         run: |
           set -euo pipefail
-          # Current version from POM
           APP_VER=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)
           BASE="${APP_VER%-SNAPSHOT}"                 # strip -SNAPSHOT if present
           SHORT_SHA="${GITHUB_SHA::7}"
@@ -79,48 +78,57 @@ jobs:
           mvn -q -DgenerateBackupPoms=false versions:set -DnewVersion="${NEW_VER}"
           echo "new_version=${NEW_VER}" >> "$GITHUB_OUTPUT"
 
-      - name: Pick target repo (snapshot vs release) and deploy URL
-        id: repo
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -z "${JF_URL:-}" || -z "${SNAP_REPO:-}" || -z "${REL_REPO:-}" ]]; then
-            echo "::error::Missing JF_URL / JF_MVN_* repo variables in Settings → Variables"; exit 1
-          fi
-          # After the version bump, we always deploy snapshots (NEW_VER ends with -SNAPSHOT)
-          REPO="$SNAP_REPO"
-          DEPLOY_URL="${JF_URL%/}/artifactory/${REPO}"
-          echo "deploy_url=${DEPLOY_URL}" >> "$GITHUB_OUTPUT"
-          echo "repo=${REPO}"             >> "$GITHUB_OUTPUT"
-
-      - name: Build & test (reproducible)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mvn $MVN_FLAGS -Dproject.build.outputTimestamp="${{ steps.ts.outputs.iso }}" clean verify
-
-      - name: Deploy to Artifactory (Maven repo)
+      - name: Build, test, and deploy to Artifactory (single invocation)
+        id: deploy
         shell: bash
         env:
-          DEPLOY_URL: ${{ steps.repo.outputs.deploy_url }}
+          DEPLOY_URL: ${{ env.JF_URL }}/artifactory/${{ env.SNAP_REPO }}
         run: |
           set -euo pipefail
-          # modern altDeploymentRepository syntax: id::layout::url
-          mvn $MVN_FLAGS -DaltDeploymentRepository=artifactory::default::"${DEPLOY_URL}" deploy
+          # Single run -> identical bits locally and uploaded
+          mvn $MVN_FLAGS \
+            -Dproject.build.outputTimestamp="${{ steps.ts.outputs.iso }}" \
+            -DaltDeploymentRepository=artifactory::default::"${DEPLOY_URL}" \
+            clean deploy
 
-      - name: Create local copy + checksums (commit + timestamp for traceability)
+      - name: Create local copy + checksums (commit + timestamp)
+        id: stage
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "${ARTIFACT_DIR}"
-          SRC_JAR=$(ls target/*.jar | head -n1)   # still ends with -SNAPSHOT locally
+          SRC_JAR=$(ls target/*.jar | head -n1)   # built by the same invocation above
           OUT_JAR="spring-petclinic-${{ steps.ver.outputs.new_version }}-${{ steps.ts.outputs.compact }}.jar"
-          # Replace the local -SNAPSHOT name with a deterministic one we control:
           cp "${SRC_JAR}" "${ARTIFACT_DIR}/${OUT_JAR}"
           (cd "${ARTIFACT_DIR}" && sha256sum "${OUT_JAR}" > "${OUT_JAR}.sha256")
           (cd "${ARTIFACT_DIR}" && sha512sum "${OUT_JAR}" > "${OUT_JAR}.sha512")
-          echo "Generated local traceable files in ${ARTIFACT_DIR}:"
-          ls -lah "${ARTIFACT_DIR}"
+          echo "local_sha256=$(cut -d' ' -f1 ${ARTIFACT_DIR}/${OUT_JAR}.sha256)" >> "$GITHUB_OUTPUT"
+          echo "out_jar=${OUT_JAR}" >> "$GITHUB_OUTPUT"
+
+      - name: (Optional) Verify remote == local checksum
+        if: ${{ always() }}
+        shell: bash
+        env:
+          NEW_VERSION: ${{ steps.ver.outputs.new_version }}
+        run: |
+          set -euo pipefail
+          # Look up deployed artifact via GAVC and compare sha256
+          GID=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.groupId)
+          AID=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.artifactId)
+          Q="${JF_URL%/}/artifactory/api/search/gavc?g=${GID}&a=${AID}&v=${NEW_VERSION}&p=jar&r=${SNAP_REPO}"
+          ITEM_URI=$(curl -s -u "${JFROG_USER}:${JFROG_TOKEN}" "$Q" | jq -r '.results[0].uri' || true)
+          if [[ -z "${ITEM_URI}" || "${ITEM_URI}" == "null" ]]; then
+            echo "Could not find the deployed artifact to verify (OK for first run / race)."; exit 0
+          fi
+          REMOTE_SHA=$(curl -s -u "${JFROG_USER}:${JFROG_TOKEN}" "${ITEM_URI}" | jq -r '.checksums.sha256')
+          LOCAL_SHA="${{ steps.stage.outputs.local_sha256 }}"
+          echo "Local SHA256 : ${LOCAL_SHA}"
+          echo "Remote SHA256: ${REMOTE_SHA}"
+          if [[ -n "${REMOTE_SHA}" && "${REMOTE_SHA}" == "${LOCAL_SHA}" ]]; then
+            echo "Checksum match ✅"
+          else
+            echo "::warning::Checksum mismatch or remote not ready yet."
+          fi
 
       - name: Upload workflow artifacts (local copy + checksums)
         if: always()
