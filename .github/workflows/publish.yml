@@ -25,10 +25,18 @@ jobs:
           cache: 'maven'
           server-id: snapshots
           # These lines correctly read from GitHub SECRETS
-          server-username: ${{ secrets.JFROG_USER }}
-          server-password: ${{ secrets.JFROG_TOKEN }}
+          server-username: ${{ var.JFROG_USER }}
+          server-password: ${{ var.JFROG_TOKEN }}
+          # This is the temporary debugging step. Its output is crucial.
+          
+      - name: DEBUG - Inspect Maven Settings (Temporary)
+        run: |
+          echo "--- Verifying location and content of settings.xml ---"
+          ls -la ~/.m2/
+          echo "--- Displaying settings.xml (secrets should be masked by GitHub) ---"
+          cat ~/.m2/settings.xml
 
       - name: Build and Deploy with Maven
         run: mvn -B deploy
         env:
-          JFROG_URL: ${{ secrets.JFROG_URL }} # Keep JFROG_URL as a secret too
+          JFROG_URL: ${{ var.JFROG_URL }} # Keep JFROG_URL as a secret too
