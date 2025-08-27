@@ -1,3 +1,8 @@
+# .github/workflows/01-build-publish-jar.yml
+# Step 1: Compile & test on the runner, run non-blocking quality gates (incl. Xray),
+# and publish the JAR to JFrog Artifactory — WITHOUT writing ~/.m2/settings.xml manually.
+# Uses actions/setup-java to inject <server id="artifactory"> and credentials.
+
 name: 01 — Build & Publish JAR
 
 on:
@@ -12,30 +17,39 @@ jobs:
   build-publish-jar:
     runs-on: ubuntu-latest
 
-    # ---- Centralized environment (including secrets -> env vars) ----
     env:
-      # JFrog / repos (set as Repository Variables)
-      JF_URL:           ${{ vars.JF_URL }}              # e.g., https://chirag095.jfrog.io
-      MAVEN_REPO:       ${{ vars.MAVEN_REPO }}          # e.g., demo-libs-snapshot (must allow snapshots)
-      # Secrets mapped to env (you asked not to reference secrets directly later)
-      JF_USER:          ${{ secrets.JFROG_USER }}
-      JF_TOKEN:         ${{ secrets.JFROG_TOKEN }}
+      # ---- Variables (set these in GitHub Settings → Variables) ----
+      JF_URL:        ${{ vars.JF_URL }}            # e.g., https://chirag095.jfrog.io
+      MAVEN_REPO:    ${{ vars.JF_MVN_SNAPSHOTS_REPO }}        # e.g., demo-libs-snapshot (must allow -SNAPSHOT)
+      MVN_FLAGS:     -B -ntp -e -V                 # batch, no transfer progress, show errors & versions
+
+      # ---- Secrets mapped to env (as requested; don't reference secrets directly later) ----
+      JF_USER:       ${{ secrets.JFROG_USER }}
+      JF_TOKEN:      ${{ secrets.JFROG_TOKEN }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with: { fetch-depth: 0 }
 
-      - name: Set up JDK 17 & Maven server credentials
+      - name: Set up Temurin JDK 17 + Maven server creds
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-          cache: 'maven'
-          # IMPORTANT: server-id must match what we use in -DaltDeploymentRepository
+          cache: maven
+          # This writes ~/.m2/settings.xml for us (no manual file edits)
           server-id: artifactory
           server-username: ${{ env.JF_USER }}
           server-password: ${{ env.JF_TOKEN }}
+
+      - name: DEBUG — Inspect Maven settings (auto-generated)
+        run: |
+          echo "Expect server id 'artifactory' in ~/.m2/settings.xml"
+          ls -la ~/.m2 || true
+          echo "----- settings.xml (secrets masked by GitHub) -----"
+          cat ~/.m2/settings.xml || true
+          echo "---------------------------------------------------"
 
       - name: Derive build metadata (version with git sha)
         id: meta
@@ -51,39 +65,26 @@ jobs:
           echo "Using project.version=${NEW_VER}"
 
       - name: Set project version (g<sha>-SNAPSHOT)
-        run: mvn -B -ntp -DgenerateBackupPoms=false versions:set -DnewVersion="${{ steps.meta.outputs.new_version }}"
+        run: mvn $MVN_FLAGS -DgenerateBackupPoms=false versions:set -DnewVersion="${{ steps.meta.outputs.new_version }}"
 
       # ------------------ Non-blocking quality checks ------------------
       - name: Checkstyle (non-blocking)
-        run: mvn -B -ntp checkstyle:check || true
+        run: mvn $MVN_FLAGS checkstyle:check || true
         continue-on-error: true
 
       - name: SpotBugs (non-blocking)
-        run: mvn -B -ntp com.github.spotbugs:spotbugs-maven-plugin:spotbugs || true
+        run: mvn $MVN_FLAGS com.github.spotbugs:spotbugs-maven-plugin:spotbugs || true
         continue-on-error: true
 
       # ------------------ Tests (no new tests to write) ----------------
       - name: Test
-        run: mvn -B -ntp -DskipITs verify
+        run: mvn $MVN_FLAGS -DskipITs verify
 
       # ------------------ Package the JAR ------------------------------
       - name: Package
-        run: mvn -B -ntp -DskipITs package
+        run: mvn $MVN_FLAGS -DskipITs package
 
-      # ------------------ Deploy to Artifactory ------------------------
-      # Fixes 401 by:
-      #  - using server-id "artifactory" (same as setup-java wrote into settings.xml)
-      #  - using modern altDeploymentRepository syntax: artifactory::<URL>/<repo>  (no 'default')
-      - name: Deploy to Artifactory (snapshots)
-        env:
-          ALT_REPO: artifactory::${{ env.JF_URL }}/artifactory/${{ env.MAVEN_REPO }}
-        run: |
-          set -euo pipefail
-          echo "Deploying to: $ALT_REPO"
-          mvn -B -ntp -DskipITs -DskipTests=true -DaltDeploymentRepository="${ALT_REPO}" deploy
-
-      # ------------------ Xray "quality gate" (non-blocking) ----------
-      # Uses JFrog CLI to audit dependencies; saves JSON report for artifacts.
+      # ------------------ Xray quality gate (non-blocking, BEFORE deploy) ------------------
       - name: Setup JFrog CLI
         uses: jfrog/setup-jfrog-cli@v4
         with:
@@ -91,15 +92,42 @@ jobs:
           jfrog-url: ${{ env.JF_URL }}
           access-token: ${{ env.JF_TOKEN }}
 
-      - name: Xray dependency audit (non-blocking, save report)
+      - name: Xray dependency audit (non-blocking; save JSON report)
+        run: |
+          set -euo pipefail
+          jf audit --mvn --format=json > xray-audit.json || true
+          echo "Saved xray-audit.json (non-blocking pre-deploy quality gate)."
+
+      # ------------------ Sanity check Artifactory repo access ------------------
+      - name: Sanity check: repo reachable with provided creds
         shell: bash
         run: |
           set -euo pipefail
-          # Audit Maven project; don't fail pipeline; save output to JSON
-          jf audit --mvn --format=json > xray-audit.json || true
-          echo "Xray audit completed (non-blocking)."
+          API="${JF_URL%/}/artifactory/api/storage/${MAVEN_REPO}"
+          echo "GET $API"
+          code=$(curl -sS -u "${JF_USER}:${JF_TOKEN}" -o /tmp/repo.json -w "%{http_code}" "$API" || true)
+          echo "HTTP $code"
+          cat /tmp/repo.json || true
+          if [ "$code" != "200" ]; then
+            echo "::error::Artifactory repo '${MAVEN_REPO}' not accessible (HTTP $code). Check repo key, user perms, or token."
+            exit 1
+          fi
 
-      - name: Upload reports & JAR as workflow artifact
+      # ------------------ Deploy to Artifactory (uses auto settings.xml) ------------------
+      # Modern altDeploymentRepository syntax: artifactory::<URL>/<repo>
+      - name: Deploy to Artifactory (snapshots)
+        env:
+          ALT_REPO: artifactory::${{ env.JF_URL }}/artifactory/${{ env.MAVEN_REPO }}
+        run: |
+          set -euo pipefail
+          echo "Deploying with ALT_REPO='${ALT_REPO}'"
+          mvn $MVN_FLAGS \
+            -DskipITs -DskipTests=true \
+            -DaltDeploymentRepository="${ALT_REPO}" \
+            deploy
+
+      # ------------------ Upload artifacts & reports ------------------
+      - name: Upload JAR, POM, and quality reports
         uses: actions/upload-artifact@v4
         with:
           name: jar-and-quality-${{ github.sha }}
@@ -107,13 +135,14 @@ jobs:
             target/*.jar
             target/*.pom
             xray-audit.json
-          if-no-files-found: warn
+          if-no-files-found: error
 
       - name: Summary
         run: |
           {
             echo "### JAR published to Artifactory"
             echo "- Version: \`${{ steps.meta.outputs.new_version }}\`"
-            echo "- Maven repo: \`${{ env.MAVEN_REPO }}\` at \`${{ env.JF_URL }}\`"
-            echo "- Workflow artifact: \`jar-and-quality-${{ github.sha }}\` (includes JAR/POM + xray-audit.json)"
+            echo "- Deploy URL: \`${{ env.JF_URL }}/artifactory/${{ env.MAVEN_REPO }}\`"
+            echo "- Quality gates: Checkstyle/SpotBugs/Xray (non-blocking) ran **before** deploy"
+            echo "- Workflow artifact: \`jar-and-quality-${{ github.sha }}\` (JAR/POM + xray-audit.json)"
           } >> "$GITHUB_STEP_SUMMARY"
