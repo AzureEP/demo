@@ -1,14 +1,14 @@
 # .github/workflows/publish.yml
-# SIMPLE + ROBUST (no jq, no GAVC):
-# - Build & test Spring PetClinic
-# - Set version to include commit id (…-g<sha>-SNAPSHOT) so Artifactory snapshot names include the commit
-# - Single Maven run (clean deploy) → same bytes locally and remotely
-# - Resolve the exact remote snapshot filename from maven-metadata.xml
-# - Create a local copy named exactly like remote + .sha256
-# - Validate checksum parity via Artifactory HEAD header (X-Checksum-Sha256)
-# - Upload local copy + checksum as a GitHub artifact
+# SIMPLE + XRAY (NON-BLOCKING):
+# - Build & test (reproducible)
+# - Version bumped to include commit id (…-g<sha>-SNAPSHOT)
+# - Run JFrog Xray audits/scans but DO NOT fail the pipeline (non-blocking)
+# - Deploy to Artifactory snapshot repo
+# - Resolve remote snapshot filename, make a local copy with the same name + .sha256
+# - Validate checksum parity (remote vs local) via HEAD header
+# - Upload local copy + checksum + Xray JSON reports as workflow artifacts
 
-name: Build and Publish to JFrog Artifactory
+name: Build and Publish to JFrog Artifactory (with non-blocking Xray)
 
 on:
   push:
@@ -81,7 +81,53 @@ jobs:
           mvn -q -DgenerateBackupPoms=false versions:set -DnewVersion="${NEW}"
           echo "new_version=${NEW}" >> "$GITHUB_OUTPUT"
 
-      - name: Build, test, and deploy (single Maven run)
+      - name: Build & test (reproducible)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mvn $MVN_FLAGS -Dproject.build.outputTimestamp="${{ steps.ts.outputs.iso }}" clean verify
+
+      # ---------- XRAY (NON-BLOCKING) ----------
+      - name: Install JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+
+      - name: Configure JFrog CLI server (non-interactive)
+        shell: bash
+        run: |
+          set -euo pipefail
+          jf c add --interactive=false \
+            --url "${JF_URL}" \
+            --user "${JFROG_USER}" \
+            --password "${JFROG_TOKEN}" \
+            --server-id-default art
+
+      - name: Xray dependency audit (Maven) — non-blocking
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          jf audit --mvn --format=json > xray-deps.json
+          echo "Dependency audit completed (non-blocking)."
+
+      - name: Xray binary scan (built JAR) — non-blocking
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          jf scan "target/*.jar" --format=json > xray-jar.json
+          echo "Binary scan completed (non-blocking)."
+
+      - name: Upload Xray JSON reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-json-${{ github.sha }}
+          path: |
+            xray-deps.json
+            xray-jar.json
+      # -----------------------------------------
+
+      - name: Deploy to Artifactory (snapshot repo)
         shell: bash
         run: |
           set -euo pipefail
@@ -90,7 +136,7 @@ jobs:
           mvn $MVN_FLAGS \
             -Dproject.build.outputTimestamp="${{ steps.ts.outputs.iso }}" \
             -DaltDeploymentRepository=artifactory::default::"${DEPLOY_URL}" \
-            clean deploy
+            deploy
 
       - name: Resolve remote snapshot filename from maven-metadata.xml
         id: remotename
@@ -103,34 +149,24 @@ jobs:
           AID=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.artifactId)
           GROUP_PATH=$(echo "$GID" | tr '.' '/')
           BASE="${NEW_VERSION%-SNAPSHOT}"
-
           META_URL="${JF_URL%/}/artifactory/${SNAP_REPO}/${GROUP_PATH}/${AID}/${NEW_VERSION}/maven-metadata.xml"
           echo "Fetching metadata: ${META_URL}"
-
           # small retry in case metadata isn't ready immediately
           for i in 1 2 3 4 5; do
             META_XML=$(curl -sS -u "${JFROG_USER}:${JFROG_TOKEN}" -H "Accept: application/xml" "$META_URL" || true)
-            # Try modern <snapshotVersions><snapshotVersion><extension>jar</extension><value>...</value></snapshotVersion>
             ONE=$(echo "$META_XML" | tr -d '\n')
             UNIQ=$(echo "$ONE" | sed -n 's:.*<snapshotVersion><extension>jar</extension><value>\([^<]*\)</value>.*:\1:p')
             if [ -n "$UNIQ" ]; then
-              REMOTE_FILE="${AID}-${UNIQ}.jar"
-              break
+              REMOTE_FILE="${AID}-${UNIQ}.jar"; break
             fi
-            # Fallback to legacy <timestamp>/<buildNumber>
             TS=$(echo "$META_XML" | sed -n 's:.*<timestamp>\(.*\)</timestamp>.*:\1:p' | head -n1)
             BN=$(echo "$META_XML" | sed -n 's:.*<buildNumber>\(.*\)</buildNumber>.*:\1:p' | head -n1)
             if [ -n "$TS" ] && [ -n "$BN" ]; then
-              REMOTE_FILE="${AID}-${BASE}-${TS}-${BN}.jar"
-              break
+              REMOTE_FILE="${AID}-${BASE}-${TS}-${BN}.jar"; break
             fi
-            echo "Metadata not ready (attempt $i); waiting…"
             sleep 2
           done
-
-          if [ -z "${REMOTE_FILE:-}" ]; then
-            echo "::error::Unable to determine snapshot filename from metadata."; exit 1
-          fi
+          [ -n "${REMOTE_FILE:-}" ] || { echo "::error::Unable to determine snapshot filename."; exit 1; }
           echo "remote_name=${REMOTE_FILE}" >> "$GITHUB_OUTPUT"
           echo "group_path=${GROUP_PATH}"   >> "$GITHUB_OUTPUT"
           echo "artifact_id=${AID}"         >> "$GITHUB_OUTPUT"
@@ -161,7 +197,6 @@ jobs:
           set -euo pipefail
           FILE_URL="${JF_URL%/}/artifactory/${SNAP_REPO}/${GROUP_PATH}/${ARTIFACT_ID}/${VERSION}/${REMOTE_NAME}"
           echo "HEAD ${FILE_URL}"
-          # short retry in case file isn't immediately accessible via CDN/edge
           REMOTE_SHA256=""
           for i in 1 2 3 4 5; do
             HDRS=$(curl -sS -I -u "${JFROG_USER}:${JFROG_TOKEN}" "${FILE_URL}" || true)
@@ -171,17 +206,18 @@ jobs:
             [ "$CODE" = "200" ] && [ -n "$REMOTE_SHA256" ] && break
             sleep 2
           done
-          if [ -z "$REMOTE_SHA256" ]; then
-            echo "::error::Could not obtain X-Checksum-Sha256 from Artifactory."; exit 1
-          fi
+          [ -n "$REMOTE_SHA256" ] || { echo "::error::Could not obtain X-Checksum-Sha256."; exit 1; }
           LOCAL_SHA256=$(cut -d' ' -f1 "${ARTIFACT_DIR}/${LOCAL_NAME}.sha256")
           echo "Remote sha256: $REMOTE_SHA256"
           echo "Local  sha256: $LOCAL_SHA256"
           [ "$REMOTE_SHA256" = "$LOCAL_SHA256" ] || { echo "::error::Checksum mismatch."; exit 1; }
           echo "Checksum match ✅"
 
-      - name: Upload artifact (local copy + sha256)
+      - name: Upload artifact (local copy + sha256 + Xray JSON)
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.stage.outputs.out_name }}
-          path: ${{ env.ARTIFACT_DIR }}/*
+          path: |
+            ${{ env.ARTIFACT_DIR }}/*
+            xray-deps.json
+            xray-jar.json
