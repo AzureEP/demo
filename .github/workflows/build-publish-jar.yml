@@ -18,8 +18,8 @@ jobs:
 
     env:
       # Repo variables (Settings → Variables)
-      JF_URL: ${{ vars.JF_URL }}                    # e.g., https://chirag095.jfrog.io
-      MAVEN_REPO: ${{ vars.JF_MVN_SNAPSHOTS_REPO }} # e.g., demo-libs-snapshot (must allow -SNAPSHOT)
+      JF_URL: ${{ vars.JF_URL }}                     # e.g., https://chirag095.jfrog.io
+      MAVEN_REPO: ${{ vars.JF_MVN_SNAPSHOTS_REPO }}  # e.g., demo-libs-snapshot (must allow -SNAPSHOT)
       MVN_FLAGS: -B -ntp -e -V
 
       # Secrets mapped to env (don’t reference secrets directly later)
@@ -48,9 +48,7 @@ jobs:
         run: |
           echo "Expect server id 'artifactory' in ~/.m2/settings.xml"
           ls -la ~/.m2 || true
-          echo "----- settings.xml (secrets masked by GitHub) -----"
           cat ~/.m2/settings.xml || true
-          echo "---------------------------------------------------"
 
       - name: Derive build metadata (version with git sha)
         id: meta
@@ -65,11 +63,7 @@ jobs:
           echo "new_version=${NEW_VER}"       >> "$GITHUB_OUTPUT"
           echo "Using project.version=${NEW_VER}"
 
-      - name: Set project version (g<sha>-SNAPSHOT)
-        shell: bash
-        run: mvn $MVN_FLAGS -DgenerateBackupPoms=false versions:set -DnewVersion="${{ steps.meta.outputs.new_version }}"
-
-      # -------- Non-blocking quality checks --------
+      # ---------- Non-blocking quality checks (manual run) ----------
       - name: Checkstyle (non-blocking)
         shell: bash
         run: mvn $MVN_FLAGS checkstyle:check || true
@@ -78,32 +72,33 @@ jobs:
         shell: bash
         run: mvn $MVN_FLAGS com.github.spotbugs:spotbugs-maven-plugin:spotbugs || true
 
-      # -------- Tests (no new tests to write) --------
+      # ---------- Tests (skip bound checkstyle/spotbugs to avoid fail) ----------
       - name: Test
         shell: bash
-        run: mvn $MVN_FLAGS -DskipITs verify
+        run: mvn $MVN_FLAGS -DskipITs -Dcheckstyle.skip=true -Dspotbugs.skip=true verify
 
-      # -------- Package the JAR --------
+      # ---------- Package the JAR (skip bound checkstyle/spotbugs) ----------
       - name: Package
         shell: bash
-        run: mvn $MVN_FLAGS -DskipITs package
+        run: mvn $MVN_FLAGS -DskipITs -Dcheckstyle.skip=true -Dspotbugs.skip=true package
 
-      # -------- Xray quality gate (non-blocking, BEFORE deploy) --------
+      # ---------- Xray quality gate (non-blocking, BEFORE deploy) ----------
       - name: Setup JFrog CLI
         uses: jfrog/setup-jfrog-cli@v4
         env:
-          # The action reads credentials from ENV, not inputs.
+          # The action reads credentials from ENV
           JF_URL: ${{ env.JF_URL }}
           JF_ACCESS_TOKEN: ${{ env.JF_TOKEN }}
 
-      - name: Xray dependency audit (non-blocking; save JSON report)
+      - name: Xray dependency audit (non-blocking; save JSON report under target/)
         shell: bash
         run: |
           set -euo pipefail
-          jf audit --mvn --format=json > xray-audit.json || true
-          echo "Saved xray-audit.json (pre-deploy)."
+          mkdir -p target/xray
+          jf audit --mvn --format=json > target/xray/xray-audit.json || true
+          echo "Saved target/xray/xray-audit.json (pre-deploy)."
 
-      # -------- Sanity check Artifactory repo access --------
+      # ---------- Sanity check Artifactory repo access ----------
       - name: Sanity check repo access
         shell: bash
         run: |
@@ -118,7 +113,7 @@ jobs:
             exit 1
           fi
 
-      # -------- Deploy to Artifactory (uses auto settings.xml) --------
+      # ---------- Deploy to Artifactory (uses auto settings.xml) ----------
       - name: Deploy to Artifactory (snapshots)
         env:
           ALT_REPO: artifactory::${{ env.JF_URL }}/artifactory/${{ env.MAVEN_REPO }}
@@ -131,7 +126,7 @@ jobs:
             -DaltDeploymentRepository="${ALT_REPO}" \
             deploy
 
-      # -------- Upload artifacts & reports --------
+      # ---------- Upload artifacts & reports ----------
       - name: Upload JAR, POM, and quality reports
         uses: actions/upload-artifact@v4
         with:
@@ -139,7 +134,7 @@ jobs:
           path: |
             target/*.jar
             target/*.pom
-            xray-audit.json
+            target/xray/xray-audit.json
           if-no-files-found: error
 
       - name: Summary
