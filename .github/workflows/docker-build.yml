@@ -1,17 +1,16 @@
 # .github/workflows/02-docker-from-jar-dev.yml
-# Build a Docker image from the exact JAR published by Step-01 and push to Dev repo,
-# then run an Xray image scan (non-blocking) and save the JSON report.
+# Build a Docker image from the JAR artifact and push to Dev; Xray image scan (non-blocking).
 
-name: 02-Docker-from-JAR-dev
+name: 02 — Docker from JAR (dev)
 
 on:
   workflow_run:
-    workflows: ["Build and Publish to JFrog Artifactory (with non-blocking Xray)"]
+    workflows: ["01 — Build & Publish JAR"]   # Make sure this EXACTLY matches your Step-01 workflow name
     types: [completed]
   workflow_dispatch:
     inputs:
       commit:
-        description: "Commit SHA to package (optional; primarily used with workflow_dispatch)"
+        description: "Commit SHA to package (defaults to triggering run)"
         required: false
 
 permissions:
@@ -23,21 +22,20 @@ jobs:
     timeout-minutes: 30
 
     env:
-      # JFrog Platform / Docker Registry
-      JF_URL:             ${{ vars.JF_URL }}                 # e.g., https://chirag095.jfrog.io
-      JF_DOCKER_REGISTRY: ${{ vars.JF_DOCKER_REGISTRY }}     # e.g., chirag095.jfrog.io
-      DOCKER_DEV_REPO:    ${{ vars.DOCKER_DEV_REPO }}        # e.g., petclinic-demo
-      IMAGE_NAME:         ${{ vars.IMAGE_NAME }}             # e.g., spring-petclinic
+      # JFrog settings (set in Repo → Settings → Variables)
+      JF_URL:              ${{ vars.JF_URL }}                 # e.g., https://chirag095.jfrog.io
+      JF_DOCKER_REGISTRY:  ${{ vars.JF_DOCKER_REGISTRY }}     # e.g., chirag095.jfrog.io
+      DOCKER_DEV_REPO:     ${{ vars.DOCKER_DEV_REPO }}        # e.g., petclinic-demo
+      IMAGE_NAME:          ${{ vars.IMAGE_NAME }}             # e.g., spring-petclinic (can be empty → defaulted)
 
       # Secrets
-      JFROG_USER:  ${{ secrets.JFROG_USER }}
-      JFROG_TOKEN: ${{ secrets.JFROG_TOKEN }}
+      JFROG_USER:          ${{ secrets.JFROG_USER }}
+      JFROG_TOKEN:         ${{ secrets.JFROG_TOKEN }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
       - name: Resolve source commit
         id: src
@@ -47,40 +45,57 @@ jobs:
           if [ -n "${{ github.event.inputs.commit || '' }}" ]; then
             SHA="${{ github.event.inputs.commit }}"
           else
-            # When triggered by workflow_run, this is the commit that ran Step-01
             SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
           fi
           SHORT="${SHA::7}"
-          echo "sha=${SHA}"   >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
           echo "short=${SHORT}" >> "$GITHUB_OUTPUT"
-          echo "Using commit: $SHA"
 
-      # Download ALL artifacts from the Step-01 run (dynamic names are used there)
-      - name: Download artifacts from Step-01 run
+      # Download artifacts from Step-01 run, if present
+      - name: Download JAR artifact from Step-01
         if: ${{ github.event_name == 'workflow_run' }}
         uses: dawidd6/action-download-artifact@v6
         with:
-          workflow: "Build and Publish to JFrog Artifactory (with non-blocking Xray)"
+          workflow: 01 — Build & Publish JAR
           run_id: ${{ github.event.workflow_run.id }}
           path: ./inbox
 
-      - name: Ensure JAR is present (from downloaded artifacts)
-        id: pickjar
+      - name: Ensure inbox exists & list files
         shell: bash
         run: |
           set -euo pipefail
-          echo "Listing downloaded artifacts:"
-          find ./inbox -maxdepth 3 -type f -print | sed 's/^/ - /'
-          # pick the first .jar we find (Step-01 uploads the final remote-named JAR)
+          mkdir -p ./inbox
+          echo "Listing downloaded artifacts (if any):"
+          find ./inbox -maxdepth 3 -type f -print | sed 's/^/ - /' || true
+
+      - name: Prepare app.jar
+        shell: bash
+        run: |
+          set -euo pipefail
           JAR=$(find ./inbox -type f -name "*.jar" | head -n1 || true)
           if [ -z "${JAR}" ]; then
-            echo "::error::No JAR found in Step-01 artifacts. Verify Step-01 uploaded a JAR."
+            echo "::error::No JAR found under ./inbox. Make sure Step-01 uploaded a JAR artifact."
             exit 1
           fi
-          cp "${JAR}" app.jar
-          echo "jar_path=${JAR}" >> "$GITHUB_OUTPUT"
-          echo "Prepared app.jar for Docker build:"
+          cp "$JAR" app.jar
+          echo "Picked JAR: $JAR"
           ls -la app.jar
+
+      - name: Ensure IMAGE_NAME is set and valid
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG="${IMAGE_NAME:-}"
+          if [ -z "$IMG" ]; then
+            echo "IMAGE_NAME not set; defaulting to 'spring-petclinic'"
+            IMG="spring-petclinic"
+          fi
+          # Enforce Docker name rules: lowercase, digits, separators . _ -
+          if ! echo "$IMG" | grep -Eq '^[a-z0-9]+([._-][a-z0-9]+)*$'; then
+            echo "::error::IMAGE_NAME '$IMG' is invalid. Use lowercase letters, digits, and separators . _ -"
+            exit 1
+          fi
+          echo "IMAGE_NAME=$IMG" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -92,18 +107,17 @@ jobs:
           username: ${{ env.JFROG_USER }}
           password: ${{ env.JFROG_TOKEN }}
 
-      - name: Build & push image (dev) — from provided JAR
+      - name: Build & push image (dev) — from app.jar
         id: buildpush
         shell: bash
-        env:
-          TAG1: ${{ env.JF_DOCKER_REGISTRY }}/${{ env.DOCKER_DEV_REPO }}/${{ env.IMAGE_NAME }}:git-${{ steps.src.outputs.short }}
-          TAG2: ${{ env.JF_DOCKER_REGISTRY }}/${{ env.DOCKER_DEV_REPO }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-latest
         run: |
           set -euo pipefail
+          TAG1="${JF_DOCKER_REGISTRY}/${DOCKER_DEV_REPO}/${IMAGE_NAME}:git-${{ steps.src.outputs.short }}"
+          TAG2="${JF_DOCKER_REGISTRY}/${DOCKER_DEV_REPO}/${IMAGE_NAME}:${GITHUB_REF_NAME}-latest"
           echo "Using tags:"
           echo " - $TAG1"
           echo " - $TAG2"
-          # Buildkit needs the jar in context as app.jar; Dockerfile copies it.
+
           docker buildx build \
             --platform linux/amd64 \
             -f docker/Dockerfile.from-jar \
@@ -112,40 +126,33 @@ jobs:
             --build-arg REPO_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
             -t "$TAG1" -t "$TAG2" \
             --push .
+
           echo "tag1=$TAG1" >> "$GITHUB_OUTPUT"
           echo "tag2=$TAG2" >> "$GITHUB_OUTPUT"
 
-      # ---------- Xray IMAGE scan (non-blocking) ----------
+      # Optional: Xray image scan (non-blocking). Keep if you want the report here too.
       - name: Install JFrog CLI
         uses: jfrog/setup-jfrog-cli@v4
-
-      - name: Configure JFrog CLI server (non-interactive)
+      - name: Configure JFrog CLI server
         shell: bash
         run: |
           set -euo pipefail
-          jf c add art \
-            --interactive=false \
-            --url "${JF_URL}" \
-            --user "${JFROG_USER}" \
-            --password "${JFROG_TOKEN}" \
-            --overwrite=true
+          jf c add art --interactive=false --url "${JF_URL}" \
+            --user "${JFROG_USER}" --password "${JFROG_TOKEN}" --overwrite=true
           jf c use art
-
       - name: Xray image scan (non-blocking, save JSON)
         continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
           IMG="${{ steps.buildpush.outputs.tag1 }}"
-          echo "Scanning image with Xray: $IMG"
-          # Prefer native docker scan command if available in your CLI version:
+          echo "Scanning $IMG"
           if jf docker scan --help >/dev/null 2>&1; then
             jf docker scan "$IMG" --format=json > xray-image.json || true
           else
-            # Fallback: generic scan may also support docker images in some CLI versions
             jf scan "$IMG" --format=json > xray-image.json || true
           fi
-          echo "Saved xray-image.json (non-blocking)."
+          echo "Saved xray-image.json"
 
       - name: Upload scan report
         if: always()
@@ -159,9 +166,10 @@ jobs:
         shell: bash
         run: |
           {
-            echo "### Dev image built from published JAR"
+            echo "### Dev image built from JAR"
             echo "- Commit: \`${{ steps.src.outputs.sha }}\`"
-            echo "- Tag 1: \`${{ steps.buildpush.outputs.tag1 }}\`"
-            echo "- Tag 2: \`${{ steps.buildpush.outputs.tag2 }}\`"
-            echo "- Xray report: \`xray-image.json\` (uploaded as artifact)"
+            echo "- Tags:"
+            echo "  - \`${{ steps.buildpush.outputs.tag1 }}\`"
+            echo "  - \`${{ steps.buildpush.outputs.tag2 }}\`"
+            echo "- Xray image report (optional): \`xray-image.json\`"
           } >> "$GITHUB_STEP_SUMMARY"
