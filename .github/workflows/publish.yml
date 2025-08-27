@@ -1,9 +1,10 @@
 # .github/workflows/publish.yml
-# SIMPLE VERSION — Build, test, and publish JAR to JFrog Artifactory (no <distributionManagement>)
-# - Rewrites version to include commit id (so Artifactory snapshot name contains the commit)
-# - Single Maven run (clean deploy) to avoid drift
-# - Makes one local copy named with commit+timestamp + .sha256
-# - Verifies remote (Artifactory) checksum == local checksum
+# SIMPLE + ROBUST:
+# - Builds & tests Spring PetClinic
+# - Sets version to include commit id (…-g<sha>-SNAPSHOT) so Artifactory snapshot names include the commit
+# - Single Maven run (clean deploy) → same bytes locally and in Artifactory
+# - Creates a local copy named with commit+timestamp + .sha256
+# - Validates checksum parity (remote vs local) with retries; fails on mismatch
 # - Uploads the local copy + checksum as a GitHub artifact
 
 name: Build and Publish to JFrog Artifactory
@@ -21,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # REQUIRED: set these in your repo settings
+      # REQUIRED repo settings:
       #   Secrets:  JFROG_USER, JFROG_TOKEN
       #   Variables: JF_URL (e.g., https://yourorg.jfrog.io)
       #              JF_MVN_SNAPSHOTS_REPO (e.g., maven-snapshots-local)
@@ -50,7 +51,14 @@ jobs:
           server-username: JFROG_USER      # NAME of env var (not the secret value)
           server-password: JFROG_TOKEN     # NAME of env var (not the secret value)
 
-      - name: Build timestamp & short commit
+      - name: Toolchain versions
+        shell: bash
+        run: |
+          set -eux
+          java -version
+          mvn -version
+
+      - name: Build timestamp & short commit (from last commit)
         id: ts
         shell: bash
         run: |
@@ -96,24 +104,89 @@ jobs:
           echo "out_name=${OUT}" >> "$GITHUB_OUTPUT"
           echo "local_sha256=$(cut -d' ' -f1 ${ARTIFACT_DIR}/${OUT}.sha256)" >> "$GITHUB_OUTPUT"
 
-      - name: Validate checksum with Artifactory (remote vs local)
+      - name: Validate checksum with Artifactory (robust)
         shell: bash
         env:
           NEW_VERSION: ${{ steps.ver.outputs.new_version }}
+          LOCAL_NAME:  ${{ steps.stage.outputs.out_name }}
         run: |
           set -euo pipefail
-          # Lookup the just-deployed jar via GAVC and compare sha256
+
+          # Ensure jq exists (usually preinstalled on ubuntu-latest)
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y && sudo apt-get install -y jq
+          fi
+
+          # 1) Derive G/A and paths
           GID=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.groupId)
           AID=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.artifactId)
-          Q="${JF_URL%/}/artifactory/api/search/gavc?g=${GID}&a=${AID}&v=${NEW_VERSION}&p=jar&r=${SNAP_REPO}"
-          ITEM_URI=$(curl -s -u "${JFROG_USER}:${JFROG_TOKEN}" "$Q" | jq -r '.results[0].uri' || true)
-          if [[ -z "${ITEM_URI}" || "${ITEM_URI}" == "null" ]]; then
-            echo "::error::Could not locate the deployed artifact via GAVC search."; exit 1
+          GROUP_PATH=$(echo "$GID" | tr '.' '/')
+          BASE="${NEW_VERSION%-SNAPSHOT}"
+
+          echo "groupId=${GID}"
+          echo "artifactId=${AID}"
+          echo "version=${NEW_VERSION}"
+          echo "repo=${SNAP_REPO}"
+
+          # Small retry helper (handles indexing lag)
+          retry_curl_json() {
+            local url="$1" tries=3
+            for i in $(seq 1 $tries); do
+              HTTP=$(curl -sS -w "%{http_code}" -u "${JFROG_USER}:${JFROG_TOKEN}" -o /tmp/resp.json "$url" || true)
+              echo "GET $url -> HTTP $HTTP (attempt $i/$tries)"
+              [[ "$HTTP" == "200" ]] && { cat /tmp/resp.json; return 0; }
+              sleep 3
+            done
+            return 1
+          }
+
+          # 2) Try GAVC search first
+          GAVC_URL="${JF_URL%/}/artifactory/api/search/gavc?g=${GID}&a=${AID}&v=${NEW_VERSION}&p=jar&r=${SNAP_REPO}"
+          echo "GAVC query: $GAVC_URL"
+          GAVC_JSON=$(retry_curl_json "$GAVC_URL" || echo "{}")
+          ITEM_URI=$(echo "$GAVC_JSON" | jq -r '.results[0].uri // empty')
+
+          # 3) If GAVC not ready, compute exact file name from maven-metadata.xml
+          if [[ -z "$ITEM_URI" ]]; then
+            META_URL="${JF_URL%/}/artifactory/${SNAP_REPO}/${GROUP_PATH}/${AID}/${NEW_VERSION}/maven-metadata.xml"
+            echo "Fetching metadata: $META_URL"
+            META_XML=$(curl -sS -u "${JFROG_USER}:${JFROG_TOKEN}" "$META_URL" || true)
+            echo "$META_XML" | head -n 40 || true
+
+            TS=$(echo "$META_XML" | grep -oP '(?<=<timestamp>)[^<]+' | head -n1 || true)
+            BN=$(echo "$META_XML" | grep -oP '(?<=<buildNumber>)[^<]+' | head -n1 || true)
+            if [[ -z "${TS}" || -z "${BN}" ]]; then
+              echo "::error::Could not parse maven-metadata.xml to construct snapshot filename."
+              exit 1
+            fi
+            REMOTE_FILE="${AID}-${BASE}-${TS}-${BN}.jar"
+            STORAGE_URL="${JF_URL%/}/artifactory/api/storage/${SNAP_REPO}/${GROUP_PATH}/${AID}/${NEW_VERSION}/${REMOTE_FILE}"
+          else
+            # ITEM_URI from GAVC is already a storage URL pointing to the artifact item
+            STORAGE_URL="$ITEM_URI"
+            REMOTE_FILE=$(basename "$(echo "$ITEM_URI" | sed 's|.*/||')")
           fi
-          REMOTE_SHA=$(curl -s -u "${JFROG_USER}:${JFROG_TOKEN}" "${ITEM_URI}" | jq -r '.checksums.sha256')
-          echo "Remote sha256: ${REMOTE_SHA}"
-          echo "Local  sha256: ${{ steps.stage.outputs.local_sha256 }}"
-          [[ -n "${REMOTE_SHA}" && "${REMOTE_SHA}" == "${{ steps.stage.outputs.local_sha256 }}" ]] || { echo "::error::Checksum mismatch"; exit 1; }
+
+          echo "Storage URL: $STORAGE_URL"
+          echo "Remote file: $REMOTE_FILE"
+
+          # 4) Fetch checksums from storage API (with short retry)
+          STORAGE_JSON=$(retry_curl_json "$STORAGE_URL" || echo "{}")
+          echo "$STORAGE_JSON" | jq . | head -n 50 || true
+          REMOTE_SHA256=$(echo "$STORAGE_JSON" | jq -r '.checksums.sha256 // empty')
+          if [[ -z "$REMOTE_SHA256" ]]; then
+            echo "::error::No sha256 found in storage JSON."
+            exit 1
+          fi
+
+          # 5) Compare with local sha256
+          LOCAL_SHA256=$(cut -d' ' -f1 "${ARTIFACT_DIR}/${LOCAL_NAME}.sha256")
+          echo "Remote sha256: $REMOTE_SHA256"
+          echo "Local  sha256: $LOCAL_SHA256"
+
+          if [[ "$REMOTE_SHA256" != "$LOCAL_SHA256" ]]; then
+            echo "::error::Checksum mismatch."; exit 1
+          fi
           echo "Checksum match ✅"
 
       - name: Upload artifact (local copy + sha256)
