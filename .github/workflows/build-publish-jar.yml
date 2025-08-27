@@ -1,3 +1,7 @@
+# .github/workflows/01-build-publish-jar.yml
+# Step 1: Build, test, run non-blocking quality gates (incl. Xray), then publish JAR to Artifactory.
+# Fixes 401 by injecting REAL creds into settings.xml (no ${env.…}) and adds diagnostics + fallback.
+
 name: 01-Build-and-Publish-JAR
 
 on:
@@ -15,18 +19,17 @@ jobs:
     env:
       # Repo variables (Settings → Variables)
       JF_URL: ${{ vars.JF_URL }}                      # e.g., https://chirag095.jfrog.io
-      MAVEN_REPO: ${{ vars.JF_MVN_SNAPSHOTS_REPO }}   # e.g., demo-libs-snapshot (LOCAL snapshot repo)
+      MAVEN_REPO: ${{ vars.JF_MVN_SNAPSHOTS_REPO }}   # e.g., demo-libs-snapshot (LOCAL snapshots)
       MVN_FLAGS: -B -ntp -e -V
 
-      # Secrets mapped to env
+      # Secrets mapped to env for CLI/curl use
       JF_USER:  ${{ secrets.JFROG_USER }}
       JF_TOKEN: ${{ secrets.JFROG_TOKEN }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
       - name: Set up Temurin JDK 17 + Maven server creds
         uses: actions/setup-java@v4
@@ -34,14 +37,15 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
           cache: 'maven'
-          server-id: artifactory                       # creates ~/.m2/settings.xml
-          server-username: ${{ env.JF_USER }}         # do not reference secrets directly
-          server-password: ${{ env.JF_TOKEN }}
+          # IMPORTANT: pass the ACTUAL secret values here (not env var names).
+          server-id: artifactory
+          server-username: ${{ secrets.JFROG_USER }}
+          server-password: ${{ secrets.JFROG_TOKEN }}
 
       - name: Debug settings.xml
         shell: bash
         run: |
-          echo "Expect server id 'artifactory' in ~/.m2/settings.xml"
+          echo "Expect <id>artifactory</id> with REAL values in ~/.m2/settings.xml"
           ls -la ~/.m2 || true
           cat ~/.m2/settings.xml || true
 
@@ -51,18 +55,17 @@ jobs:
         run: |
           set -euo pipefail
           SHA_SHORT="${GITHUB_SHA::7}"
-          CURR_VER=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)
-          BASE_VER="${CURR_VER%-SNAPSHOT}"
-          NEW_VER="${BASE_VER}-g${SHA_SHORT}-SNAPSHOT"
-          echo "sha_short=${SHA_SHORT}" >> "$GITHUB_OUTPUT"
-          echo "new_version=${NEW_VER}" >> "$GITHUB_OUTPUT"
-          echo "Using project.version=${NEW_VER}"
+          CURR=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)
+          BASE="${CURR%-SNAPSHOT}"
+          NEW="${BASE}-g${SHA_SHORT}-SNAPSHOT"
+          echo "new_version=${NEW}" >> "$GITHUB_OUTPUT"
+          echo "Using project.version=${NEW}"
 
       - name: Set project version
         shell: bash
         run: mvn $MVN_FLAGS -DgenerateBackupPoms=false versions:set -DnewVersion="${{ steps.meta.outputs.new_version }}"
 
-      # ---------- Non-blocking quality checks ----------
+      # ---- Non-blocking quality checks ----
       - name: Checkstyle (non-blocking)
         shell: bash
         run: mvn $MVN_FLAGS checkstyle:check || true
@@ -71,7 +74,7 @@ jobs:
         shell: bash
         run: mvn $MVN_FLAGS com.github.spotbugs:spotbugs-maven-plugin:spotbugs || true
 
-      # ---------- Test & Package (skip bound style plugins that fail build) ----------
+      # ---- Test & Package (skip bound style plugins that may fail) ----
       - name: Test
         shell: bash
         run: mvn $MVN_FLAGS -DskipITs -Dcheckstyle.skip=true -Dspotbugs.skip=true verify
@@ -80,8 +83,8 @@ jobs:
         shell: bash
         run: mvn $MVN_FLAGS -DskipITs -Dcheckstyle.skip=true -Dspotbugs.skip=true package
 
-      # ---------- Xray quality gate (non-blocking, BEFORE upload) ----------
-      - name: Setup JFrog CLI
+      # ---- Xray quality gate (non-blocking, BEFORE upload) ----
+      - name: Setup JFrog CLI for Xray
         uses: jfrog/setup-jfrog-cli@v4
         env:
           JF_URL: ${{ env.JF_URL }}
@@ -95,7 +98,7 @@ jobs:
           jf audit --mvn --format=json > target/xray/xray-audit.json || true
           echo "Saved target/xray/xray-audit.json (pre-deploy)."
 
-      # ---------- Resolve GAV & files ----------
+      # ---- Resolve GAV & files ----
       - name: Resolve GAV and built files
         id: gav
         shell: bash
@@ -106,38 +109,52 @@ jobs:
           V=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)
           JAR=$(ls -1 target/*.jar | head -n1)
           POM=$(ls -1 target/*.pom | head -n1 || echo "pom.xml")
-          echo "groupId=${G}"        >> "$GITHUB_OUTPUT"
-          echo "artifactId=${A}"     >> "$GITHUB_OUTPUT"
-          echo "version=${V}"        >> "$GITHUB_OUTPUT"
-          echo "jar=${JAR}"          >> "$GITHUB_OUTPUT"
-          echo "pom=${POM}"          >> "$GITHUB_OUTPUT"
+          GP=$(echo "$G" | tr . /)
+          echo "groupId=${G}"  >> "$GITHUB_OUTPUT"
+          echo "artifactId=${A}" >> "$GITHUB_OUTPUT"
+          echo "version=${V}"  >> "$GITHUB_OUTPUT"
+          echo "groupPath=${GP}" >> "$GITHUB_OUTPUT"
+          echo "jar=${JAR}"    >> "$GITHUB_OUTPUT"
+          echo "pom=${POM}"    >> "$GITHUB_OUTPUT"
           echo "GAV: ${G}:${A}:${V}"
           echo "JAR: ${JAR}"
           echo "POM: ${POM}"
 
-      # ---------- Prove auth to the exact metadata path (diagnostic) ----------
-      - name: Check metadata URL auth (diagnostic)
+      # ---- Diagnose the exact metadata URL with auth ----
+      - name: Diagnose metadata URL auth
         shell: bash
         run: |
           set -euo pipefail
-          G="${{ steps.gav.outputs.groupId }}"
-          A="${{ steps.gav.outputs.artifactId }}"
-          V="${{ steps.gav.outputs.version }}"
-          META="${JF_URL%/}/artifactory/${MAVEN_REPO}/$(echo "$G" | tr . /)/${A}/${V}/maven-metadata.xml"
-          echo "GET $META"
-          code=$(curl -sS -u "${JF_USER}:${JF_TOKEN}" -o /tmp/meta.xml -w "%{http_code}" "$META" || true)
-          echo "HTTP $code"
-          if [ "$code" = "401" ]; then
-            echo "::warning::401 on metadata GET — switching to deploy:deploy-file to bypass remote metadata fetch."
-          fi
+          META="${JF_URL%/}/artifactory/${MAVEN_REPO}/${{ steps.gav.outputs.groupPath }}/${{ steps.gav.outputs.artifactId }}/${{ steps.gav.outputs.version }}/maven-metadata.xml"
+          echo "curl -i $META"
+          curl -i -u "${JF_USER}:${JF_TOKEN}" "$META" || true
+          echo ""
+          echo "If this returns 401 without WWW-Authenticate, Maven may not retry with auth. We'll still try deploy, then fallback."
 
-      # ---------- Upload using deploy:deploy-file (explicit URL + repositoryId) ----------
-      - name: Deploy JAR & POM to Artifactory (deploy-file)
+      # ---- Try standard mvn deploy (modern alt repo syntax) ----
+      - name: Deploy via mvn deploy (primary)
+        id: deploy_try
+        shell: bash
+        continue-on-error: true
+        env:
+          ALT_REPO: artifactory::${{ env.JF_URL }}/artifactory/${{ env.MAVEN_REPO }}
+        run: |
+          set -euo pipefail
+          echo "ALT_REPO='${ALT_REPO}'"
+          mvn $MVN_FLAGS \
+            -DskipITs -DskipTests=true \
+            -DaltDeploymentRepository="${ALT_REPO}" \
+            deploy
+
+      # ---- Fallback: deploy:deploy-file (explicit upload) ----
+      - name: Deploy via deploy-file (fallback if deploy failed)
+        if: ${{ steps.deploy_try.outcome == 'failure' }}
         shell: bash
         env:
           DEPLOY_URL: ${{ env.JF_URL }}/artifactory/${{ env.MAVEN_REPO }}
         run: |
           set -euo pipefail
+          echo "::warning::mvn deploy failed. Falling back to deploy:deploy-file."
           echo "Deploy URL: ${DEPLOY_URL}"
           mvn $MVN_FLAGS deploy:deploy-file \
             -Dfile="${{ steps.gav.outputs.jar }}" \
@@ -146,7 +163,7 @@ jobs:
             -DrepositoryId=artifactory \
             -DgeneratePom=false
 
-      # ---------- Upload artifacts & reports ----------
+      # ---- Upload artifacts & reports ----
       - name: Upload JAR, POM, and quality reports
         uses: actions/upload-artifact@v4
         with:
@@ -161,10 +178,9 @@ jobs:
         shell: bash
         run: |
           {
-            echo "### JAR uploaded to Artifactory (deploy-file)"
-            echo "- GAV: \`${{ steps.gav.outputs.groupId }}:${{ steps.gav.outputs.artifactId }}:${{ steps.gav.outputs.version }}\`"
-            echo "- Repo: \`${{ env.MAVEN_REPO }}\` @ \`${{ env.JF_URL }}\`"
-            echo "- Upload method: \`deploy:deploy-file\` (avoids remote metadata fetch)"
-            echo "- Quality gates (non-blocking) ran **before** upload"
-            echo "- Workflow artifact: \`jar-and-quality-${{ github.sha }}\`"
+            echo "### JAR published to Artifactory"
+            echo "- Version: \`${{ steps.meta.outputs.new_version }}\`"
+            echo "- Repo: \`${{ env.MAVEN_REPO }}\` at \`${{ env.JF_URL }}\`"
+            echo "- Primary deploy: \`${{ steps.deploy_try.outcome }}\`"
+            echo "- Xray: non-blocking, pre-deploy"
           } >> "$GITHUB_STEP_SUMMARY"
