@@ -11,7 +11,7 @@ on:
         description: "Dev tag to promote (e.g., git-104c263)"
         required: true
       targetTag:
-        description: "Prod tag (release version, e.g., 1.2.3). Leave blank to reuse sourceTag"
+        description: "Prod tag (release version, e.g., 0.1.0). Leave blank to reuse sourceTag"
         required: false
 
 permissions:
@@ -20,7 +20,7 @@ permissions:
 jobs:
   promote:
     runs-on: ubuntu-latest
-    # We need write here to create the GitHub Release
+    # Needed for creating the GitHub Release
     permissions:
       contents: write
     environment:
@@ -30,8 +30,8 @@ jobs:
       # Set these as Repository Variables (Settings → Variables):
       #   JF_URL=https://chirag095.jfrog.io
       #   JF_DOCKER_REGISTRY=chirag095.jfrog.io
-      #   DOCKER_DEV_REPO=docker-petclinic-dev
-      #   DOCKER_PROD_REPO=docker-petclinic-prod
+      #   DOCKER_DEV_REPO=petclinic-demo
+      #   DOCKER_PROD_REPO=petclinic-prd
       JF_URL:              ${{ vars.JF_URL }}
       JF_DOCKER_REGISTRY:  ${{ vars.JF_DOCKER_REGISTRY }}
       DOCKER_DEV_REPO:     ${{ vars.DOCKER_DEV_REPO }}
@@ -61,8 +61,8 @@ jobs:
             FULL="$SHORT"
           fi
 
-          echo "src=$SRC"           >> "$GITHUB_OUTPUT"
-          echo "tgt=$TGT"           >> "$GITHUB_OUTPUT"
+          echo "src=$SRC"            >> "$GITHUB_OUTPUT"
+          echo "tgt=$TGT"            >> "$GITHUB_OUTPUT"
           echo "short_commit=$SHORT" >> "$GITHUB_OUTPUT"
           echo "full_commit=$FULL"   >> "$GITHUB_OUTPUT"
 
@@ -88,33 +88,96 @@ jobs:
                "$URL" -o /tmp/promote.json
           echo "Response:"; cat /tmp/promote.json
 
-      - name: Verify digest parity (dev vs prod)
+      - name: Verify digest parity (robust)
         id: digests
         shell: bash
+        env:
+          NAME: ${{ env.IMAGE_NAME }}
         run: |
           set -euo pipefail
+
           SRC="${{ steps.vars.outputs.src }}"
           TGT="${{ steps.vars.outputs.tgt }}"
-          NAME="${{ env.IMAGE_NAME }}"
+          DEV_REPO="${{ env.DOCKER_DEV_REPO }}"
+          PRD_REPO="${{ env.DOCKER_PROD_REPO }}"
+          NAME="${NAME}"
 
-          dev_url="${{ env.JF_URL }}/artifactory/api/docker/${{ env.DOCKER_DEV_REPO }}/v2/${NAME}/manifests/${SRC}"
-          prod_url="${{ env.JF_URL }}/artifactory/api/docker/${{ env.DOCKER_PROD_REPO }}/v2/${NAME}/manifests/${TGT}"
+          # Registry endpoints (preferred for digest header)
+          DEV_REG_URL="https://${{ env.JF_DOCKER_REGISTRY }}/v2/${DEV_REPO}/${NAME}/manifests/${SRC}"
+          PRD_REG_URL="https://${{ env.JF_DOCKER_REGISTRY }}/v2/${PRD_REPO}/${NAME}/manifests/${TGT}"
 
-          dev_hdrs=$(curl -sSI -u "${{ secrets.JFROG_USER }}:${{ secrets.JFROG_TOKEN }}" "$dev_url")
-          prod_hdrs=$(curl -sSI -u "${{ secrets.JFROG_USER }}:${{ secrets.JFROG_TOKEN }}" "$prod_url")
+          # Artifactory API endpoints (secondary)
+          DEV_API_URL="${{ env.JF_URL }}/artifactory/api/docker/${DEV_REPO}/v2/${NAME}/manifests/${SRC}"
+          PRD_API_URL="${{ env.JF_URL }}/artifactory/api/docker/${PRD_REPO}/v2/${NAME}/manifests/${TGT}"
 
-          dev_digest=$(echo "$dev_hdrs"  | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' | tail -n1)
-          prod_digest=$(echo "$prod_hdrs" | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' | tail -n1)
+          # Try to fetch Docker-Content-Digest header with correct Accept types
+          get_digest() {
+            local url="$1"
+            local hdrs=""
+            local val=""
+            for accept in \
+              'application/vnd.docker.distribution.manifest.v2+json' \
+              'application/vnd.oci.image.manifest.v1+json' \
+              'application/vnd.oci.image.index.v1+json'
+            do
+              hdrs=$(curl -sSI -u "${{ secrets.JFROG_USER }}:${{ secrets.JFROG_TOKEN }}" -H "Accept: ${accept}" "$url" || true)
+              val=$(printf '%s' "$hdrs" | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' | tail -n1)
+              if [ -n "$val" ]; then
+                echo "$val"
+                return 0
+              fi
+            done
+            echo ""
+            return 1
+          }
 
-          echo "Dev  digest: $dev_digest"
-          echo "Prod digest: $prod_digest"
+          # Fallback: compute digest by hashing the manifest bytes we GET
+          get_digest_by_hash() {
+            local url="$1"
+            local body="/tmp/manifest.$RANDOM.json"
+            curl -sS -u "${{ secrets.JFROG_USER }}:${{ secrets.JFROG_TOKEN }}" \
+                 -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+                 "$url" -o "$body" || true
+            if [ -s "$body" ]; then
+              local sum
+              sum=$(sha256sum "$body" | cut -d' ' -f1)
+              echo "sha256:${sum}"
+              return 0
+            fi
+            echo ""
+            return 1
+          }
 
-          [ -n "$dev_digest" ]  || { echo "::error::Missing dev digest";  exit 1; }
-          [ -n "$prod_digest" ] || { echo "::error::Missing prod digest"; exit 1; }
-          [ "$dev_digest" = "$prod_digest" ] || { echo "::error::Digest mismatch after promotion"; exit 1; }
+          # Dev digest: try registry → API → hash
+          DEV_DIG=""
+          for url in "$DEV_REG_URL" "$DEV_API_URL"; do
+            DEV_DIG=$(get_digest "$url") && [ -n "$DEV_DIG" ] && break || true
+          done
+          if [ -z "$DEV_DIG" ]; then
+            for url in "$DEV_REG_URL" "$DEV_API_URL"; do
+              DEV_DIG=$(get_digest_by_hash "$url") && [ -n "$DEV_DIG" ] && break || true
+            done
+          fi
 
-          echo "dev_digest=$dev_digest"   >> "$GITHUB_OUTPUT"
-          echo "prod_digest=$prod_digest" >> "$GITHUB_OUTPUT"
+          # Prod digest: try registry → API → hash
+          PRD_DIG=""
+          for url in "$PRD_REG_URL" "$PRD_API_URL"; do
+            PRD_DIG=$(get_digest "$url") && [ -n "$PRD_DIG" ] && break || true
+          done
+          if [ -z "$PRD_DIG" ]; then
+            for url in "$PRD_REG_URL" "$PRD_API_URL"; do
+              PRD_DIG=$(get_digest_by_hash "$url") && [ -n "$PRD_DIG" ] && break || true
+            done
+          fi
+
+          echo "Dev  digest: $DEV_DIG"
+          echo "Prod digest: $PRD_DIG"
+          [ -n "$DEV_DIG" ]  || { echo "::error::Missing dev digest";  exit 1; }
+          [ -n "$PRD_DIG" ]  || { echo "::error::Missing prod digest"; exit 1; }
+          [ "$DEV_DIG" = "$PRD_DIG" ] || { echo "::error::Digest mismatch after promotion"; exit 1; }
+
+          echo "dev_digest=$DEV_DIG"   >> "$GITHUB_OUTPUT"
+          echo "prod_digest=$PRD_DIG"  >> "$GITHUB_OUTPUT"
           echo "Promotion OK — digests match ✅"
 
       - name: Create release mapping JSON
