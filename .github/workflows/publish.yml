@@ -17,9 +17,9 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # Secrets/vars you must set in the repo:
-      # - secrets: JFROG_USER, JFROG_TOKEN
-      # - vars:    JF_URL (e.g. https://yourorg.jfrog.io),
+      # Set these in your repo:
+      # Secrets: JFROG_USER, JFROG_TOKEN
+      # Variables: JF_URL (e.g. https://yourorg.jfrog.io),
       #            JF_MVN_SNAPSHOTS_REPO (e.g. maven-snapshots-local),
       #            JF_MVN_RELEASES_REPO  (e.g. maven-releases-local)
       JFROG_USER:  ${{ secrets.JFROG_USER }}
@@ -39,7 +39,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      # IMPORTANT: pass ENV VAR NAMES to setup-java (so settings.xml uses ${env.JFROG_USER/TOKEN})
+      # IMPORTANT: pass ENV VAR NAMES (not values) so settings.xml uses ${env.JFROG_USER/TOKEN}
       - name: Set up JDK 17 and Maven server credentials
         uses: actions/setup-java@v4
         with:
@@ -69,13 +69,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "--- ~/.m2 directory:"
+          echo '--- ~/.m2 directory:'
           ls -la ~/.m2/ || true
-          echo "--- ~/.m2/settings.xml (password masked):"
+
+          echo '--- ~/.m2/settings.xml (password masked):'
           sed -E 's#(<password>).*?(</password>)#\1***MASKED***\2#g' ~/.m2/settings.xml || true
-          echo "--- Expect to see <id>artifactory</id> and <username>${env.JFROG_USER}</username>:"
-          grep -n "<id>artifactory</id>" ~/.m2/settings.xml || (echo "Server id 'artifactory' not found!" && exit 1)
-          grep -n "<username>\$\{env.JFROG_USER\}</username>" ~/.m2/settings.xml || true
+
+          echo '--- Expect to see <id>artifactory</id> and literal <username>${env.JFROG_USER}</username>:'
+          grep -n '<id>artifactory</id>' ~/.m2/settings.xml || { echo "Server id 'artifactory' not found!"; exit 1; }
+          # Match the literal placeholder (escape $, {, }, and .)
+          grep -n '<username>\$\{env\.JFROG_USER\}</username>' ~/.m2/settings.xml || true
 
       - name: Resolve project version & choose target repo
         id: repo
