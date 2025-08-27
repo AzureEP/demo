@@ -16,8 +16,8 @@ jobs:
       # Set these in repo Settings → Variables
       JF_URL:              ${{ vars.JF_URL }}                 # e.g., https://chirag095.jfrog.io
       JF_DOCKER_REGISTRY:  ${{ vars.JF_DOCKER_REGISTRY }}     # e.g., chirag095.jfrog.io
-      DOCKER_DEV_REPO:     ${{ vars.DOCKER_DEV_REPO }}        # e.g., docker-petclinic-dev
-      DOCKER_PROD_REPO:    ${{ vars.DOCKER_PROD_REPO }}       # e.g., docker-petclinic-prod
+      DOCKER_DEV_REPO:     ${{ vars.DOCKER_DEV_REPO }}        # e.g., petclinic-demo
+      DOCKER_PROD_REPO:    ${{ vars.DOCKER_PROD_REPO }}       # e.g., petclinic-prod
       IMAGE_NAME:          spring-petclinic
 
     steps:
@@ -65,20 +65,55 @@ jobs:
             -t "$TAG1" -t "$TAG2" \
             --push .
 
-      - name: Fetch dev image digest (audit)
+      - name: Fetch dev image digest (robust)
         id: digest
         env:
-          IMAGE_REF: ${{ env.JF_DOCKER_REGISTRY }}/${{ env.DOCKER_DEV_REPO }}/${{ env.IMAGE_NAME }}:git-${{ steps.meta.outputs.sha }}
+          REGISTRY:  ${{ env.JF_DOCKER_REGISTRY }}
+          BASE_URL:  ${{ env.JF_URL }}
+          DEV_REPO:  ${{ env.DOCKER_DEV_REPO }}
+          IMAGE:     ${{ env.IMAGE_NAME }}
+          TAG:       git-${{ steps.meta.outputs.sha }}
         run: |
           set -euo pipefail
-          REPO="${{ env.DOCKER_DEV_REPO }}"
-          NAME="${{ env.IMAGE_NAME }}"
-          TAG="git-${{ steps.meta.outputs.sha }}"
-          URL="${{ env.JF_URL }}/artifactory/api/docker/${REPO}/v2/${NAME}/manifests/${TAG}"
-          HDRS=$(curl -sSI -u "${{ secrets.JFROG_USER }}:${{ secrets.JFROG_TOKEN }}" "$URL")
-          DIGEST=$(echo "$HDRS" | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' | tail -n1)
+
+          # 1) Artifactory API path
+          API_URL="${BASE_URL%/}/artifactory/api/docker/${DEV_REPO}/v2/${IMAGE}/manifests/${TAG}"
+          DIGEST=""
+          LAST_HDRS=""
+
+          for accept in \
+            'application/vnd.docker.distribution.manifest.v2+json' \
+            'application/vnd.oci.image.manifest.v1+json' \
+            'application/vnd.oci.image.index.v1+json'
+          do
+            HDRS=$(curl -sSI -u "${{ secrets.JFROG_USER }}:${{ secrets.JFROG_TOKEN }}" -H "Accept: $accept" "$API_URL" || true)
+            VAL=$(echo "$HDRS" | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' | tail -n1)
+            if [ -n "$VAL" ]; then DIGEST="$VAL"; LAST_HDRS="$HDRS"; break; fi
+            LAST_HDRS="$HDRS"
+          done
+
+          # 2) Fallback: standard registry v2 endpoint
+          if [ -z "$DIGEST" ]; then
+            REG_URL="https://${REGISTRY}/v2/${DEV_REPO}/${IMAGE}/manifests/${TAG}"
+            for accept in \
+              'application/vnd.docker.distribution.manifest.v2+json' \
+              'application/vnd.oci.image.manifest.v1+json' \
+              'application/vnd.oci.image.index.v1+json'
+            do
+              HDRS=$(curl -sSI -u "${{ secrets.JFROG_USER }}:${{ secrets.JFROG_TOKEN }}" -H "Accept: $accept" "$REG_URL" || true)
+              VAL=$(echo "$HDRS" | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' | tail -n1)
+              if [ -n "$VAL" ]; then DIGEST="$VAL"; LAST_HDRS="$HDRS"; break; fi
+              LAST_HDRS="$HDRS"
+            done
+          fi
+
+          if [ -z "$DIGEST" ]; then
+            echo "::warning::Digest header not found. Last response headers below (for debugging):"
+            echo "$LAST_HDRS"
+          fi
+
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "Dev image digest: ${DIGEST}"
+          echo "Dev image digest: ${DIGEST:-<empty>}"
 
       - name: Summary
         run: |
@@ -90,5 +125,5 @@ jobs:
             echo "- Tags:"
             echo "  - \`${{ env.JF_DOCKER_REGISTRY }}/${{ env.DOCKER_DEV_REPO }}/${{ env.IMAGE_NAME }}:git-${{ steps.meta.outputs.sha }}\`"
             echo "  - \`${{ env.JF_DOCKER_REGISTRY }}/${{ env.DOCKER_DEV_REPO }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.branch }}-latest\`"
-            echo "- Digest: \`${{ steps.digest.outputs.digest }}\`"
+            echo "- Digest: \`${{ steps.digest.outputs.digest || '<empty>' }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
