@@ -1,7 +1,7 @@
 # .github/workflows/publish.yml
 # Simple: Build, test, and publish JAR to JFrog Artifactory (no <distributionManagement>)
-# Also creates a copy of the JAR named with commit + timestamp and generates SHA256/SHA512,
-# uploaded as a GitHub Actions artifact for traceability.
+# Version is rewritten to include commit id so Artifactory filenames contain both commit + timestamp.
+# Local SHA256/SHA512 files are uploaded as a workflow artifact.
 
 name: Build and Publish to JFrog Artifactory
 
@@ -30,7 +30,7 @@ jobs:
       REL_REPO:    ${{ vars.JF_MVN_RELEASES_REPO }}
 
       ARTIFACT_DIR: dist
-      MVN_FLAGS: "-B -ntp -C -e"  # batch, no transfer progress, strict checksums, stacktraces on error
+      MVN_FLAGS: "-B -ntp -C -e"  # batch, no transfer progress, strict checksums, stacktraces
 
     steps:
       - name: Checkout
@@ -62,10 +62,24 @@ jobs:
         run: |
           set -euo pipefail
           COMMIT_TS=$(git log -1 --format=%ct)
-          echo "iso=$(date -u -d @${COMMIT_TS} +%Y-%m-%dT%H:%M:%SZ)"      >> "$GITHUB_OUTPUT"
-          echo "compact=$(date -u -d @${COMMIT_TS} +%Y%m%dT%H%M%SZ)"       >> "$GITHUB_OUTPUT"
+          echo "iso=$(date -u -d @${COMMIT_TS} +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "compact=$(date -u -d @${COMMIT_TS} +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
 
-      - name: Pick target repo and deploy URL
+      - name: Set version to include commit id (so filenames include it)
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Current version from POM
+          APP_VER=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)
+          BASE="${APP_VER%-SNAPSHOT}"                 # strip -SNAPSHOT if present
+          SHORT_SHA="${GITHUB_SHA::7}"
+          NEW_VER="${BASE}-g${SHORT_SHA}-SNAPSHOT"    # e.g., 3.5.0-gabc1234-SNAPSHOT
+          echo "Setting new version: ${NEW_VER}"
+          mvn -q -DgenerateBackupPoms=false versions:set -DnewVersion="${NEW_VER}"
+          echo "new_version=${NEW_VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Pick target repo (snapshot vs release) and deploy URL
         id: repo
         shell: bash
         run: |
@@ -73,16 +87,11 @@ jobs:
           if [[ -z "${JF_URL:-}" || -z "${SNAP_REPO:-}" || -z "${REL_REPO:-}" ]]; then
             echo "::error::Missing JF_URL / JF_MVN_* repo variables in Settings → Variables"; exit 1
           fi
-          APP_VER=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)
-          case "$APP_VER" in *-SNAPSHOT) REPO="$SNAP_REPO" ;; *) REPO="$REL_REPO" ;; esac
+          # After the version bump, we always deploy snapshots (NEW_VER ends with -SNAPSHOT)
+          REPO="$SNAP_REPO"
           DEPLOY_URL="${JF_URL%/}/artifactory/${REPO}"
           echo "deploy_url=${DEPLOY_URL}" >> "$GITHUB_OUTPUT"
-
-      - name: Quick Artifactory auth check
-        shell: bash
-        run: |
-          set -eux
-          curl -sSIf -u "${JFROG_USER}:${JFROG_TOKEN}" "${JF_URL%/}/artifactory/api/system/ping" >/dev/null
+          echo "repo=${REPO}"             >> "$GITHUB_OUTPUT"
 
       - name: Build & test (reproducible)
         shell: bash
@@ -99,23 +108,23 @@ jobs:
           # modern altDeploymentRepository syntax: id::layout::url
           mvn $MVN_FLAGS -DaltDeploymentRepository=artifactory::default::"${DEPLOY_URL}" deploy
 
-      - name: Create named copy + checksums (commit + timestamp)
-        id: stage
+      - name: Create local copy + checksums (commit + timestamp for traceability)
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "${ARTIFACT_DIR}"
-          SRC_JAR=$(ls target/*.jar | head -n1)
-          OUT_JAR="petclinic-${GITHUB_SHA}-${{ steps.ts.outputs.compact }}.jar"
+          SRC_JAR=$(ls target/*.jar | head -n1)   # still ends with -SNAPSHOT locally
+          OUT_JAR="spring-petclinic-${{ steps.ver.outputs.new_version }}-${{ steps.ts.outputs.compact }}.jar"
+          # Replace the local -SNAPSHOT name with a deterministic one we control:
           cp "${SRC_JAR}" "${ARTIFACT_DIR}/${OUT_JAR}"
           (cd "${ARTIFACT_DIR}" && sha256sum "${OUT_JAR}" > "${OUT_JAR}.sha256")
           (cd "${ARTIFACT_DIR}" && sha512sum "${OUT_JAR}" > "${OUT_JAR}.sha512")
-          echo "out_jar=${OUT_JAR}" >> "$GITHUB_OUTPUT"
+          echo "Generated local traceable files in ${ARTIFACT_DIR}:"
+          ls -lah "${ARTIFACT_DIR}"
 
-      - name: Upload workflow artifacts (local record)
+      - name: Upload workflow artifacts (local copy + checksums)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: jar-${{ github.sha }}
-          path: |
-            ${{ env.ARTIFACT_DIR }}/*
+          path: ${{ env.ARTIFACT_DIR }}/*
