@@ -1,6 +1,5 @@
 # Filename: .github/workflows/publish.yml
-# This version is CORRECTED to use a repository VARIABLE for the token.
-# It also includes debugging steps.
+# FINAL RECOMMENDED VERSION
 
 name: Build and Publish to JFrog Artifactory
 
@@ -12,16 +11,10 @@ jobs:
   build-and-publish:
     runs-on: ubuntu-latest
 
-    # This 'env' block makes the token available as a variable within the job.
-    # It now correctly reads from `vars` instead of `secrets`.
-    env:
-      JFROG_TOKEN_ENV: ${{ vars.JFROG_TOKEN }}
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          # fetch-depth: 0 is important for the git-commit-id-maven-plugin to get git history.
           fetch-depth: 0
 
       - name: Set up JDK 17 and Maven settings.xml
@@ -30,20 +23,12 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
           cache: 'maven'
-          server-id: snapshots # This MUST match the <id> in your pom.xml
+          server-id: snapshots
+          # These lines correctly read from GitHub SECRETS
           server-username: ${{ secrets.JFROG_USER }}
-          # We now use the environment variable (sourced from `vars`) to pass the password.
-          server-password: ${{ env.JFROG_TOKEN_ENV }}
-
-      # This is the temporary debugging step. Its output is crucial.
-      - name: DEBUG - Inspect Maven Settings (Temporary)
-        run: |
-          echo "--- Verifying location and content of settings.xml ---"
-          ls -la ~/.m2/
-          echo "--- Displaying settings.xml (secrets should be masked by GitHub) ---"
-          cat ~/.m2/settings.xml
+          server-password: ${{ secrets.JFROG_TOKEN }}
 
       - name: Build and Deploy with Maven
         run: mvn -B deploy
         env:
-          JFROG_URL: ${{ secrets.JFROG_URL }}
+          JFROG_URL: ${{ secrets.JFROG_URL }} # Keep JFROG_URL as a secret too
