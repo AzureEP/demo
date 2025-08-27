@@ -1,13 +1,8 @@
-# .github/workflows/publish.yml
-# Build & Publish with non-blocking Xray + checksum parity
-# - Reproducible build; version includes commit (…-g<sha>-SNAPSHOT)
-# - Xray audits/scans (non-blocking) -> JSON saved under target/xray/
-# - Deploy to Artifactory snapshot repo
-# - Resolve remote snapshot filename; create local copy named exactly like remote + .sha256
-# - Verify remote vs local checksum via Artifactory HEAD header
-# - Upload local copy + checksum + Xray JSONs as workflow artifacts
+# .github/workflows/01-build-publish-jar.yml
+# Build, test, non-blocking quality gates (Xray), publish to Artifactory,
+# resolve the unique SNAPSHOT filename, and verify checksum parity.
 
-name: Build and Publish to JFrog Artifactory (with non-blocking Xray)
+name: 01-Build-and-Publish-JAR
 
 on:
   push:
@@ -20,19 +15,17 @@ permissions:
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     env:
-      # REQUIRED repo settings:
-      #   Secrets:  JFROG_USER, JFROG_TOKEN
-      #   Variables: JF_URL (e.g., https://yourorg.jfrog.io)
-      #              JF_MVN_SNAPSHOTS_REPO (e.g., maven-snapshots-local)
+      # Secrets
       JFROG_USER:  ${{ secrets.JFROG_USER }}
       JFROG_TOKEN: ${{ secrets.JFROG_TOKEN }}
-      JF_URL:      ${{ vars.JF_URL }}
-      SNAP_REPO:   ${{ vars.JF_MVN_SNAPSHOTS_REPO }}
-
+      # Variables
+      JF_URL:      ${{ vars.JF_URL }}                 # e.g. https://chirag095.jfrog.io
+      SNAP_REPO:   ${{ vars.JF_MVN_SNAPSHOTS_REPO }}  # e.g. demo-libs-snapshot
       ARTIFACT_DIR: dist
-      MVN_FLAGS: "-B -ntp -C -e"   # batch, no transfer progress, strict checksums, stacktraces
+      MVN_FLAGS: "-B -ntp -C -e"
 
     steps:
       - name: Checkout
@@ -40,7 +33,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Clean any leftover scan files so Checkstyle NoHttp won't see them
+      # Keep scan JSONs out of source root so Checkstyle NoHttp won't trip
       - name: Pre-clean scan outputs
         shell: bash
         run: |
@@ -48,7 +41,7 @@ jobs:
           rm -f xray-*.json || true
           rm -rf target/xray || true
 
-      # Writes ~/.m2/settings.xml with <server id="artifactory"> using ENV VAR NAMES below
+      # Inject server id 'artifactory' using ENV VAR NAMES (this is what works in your env)
       - name: Setup JDK 17 + Maven server creds
         uses: actions/setup-java@v4
         with:
@@ -56,8 +49,8 @@ jobs:
           java-version: "17"
           cache: maven
           server-id: artifactory
-          server-username: JFROG_USER      # NAME of env var (not the secret value)
-          server-password: JFROG_TOKEN     # NAME of env var (not the secret value)
+          server-username: JFROG_USER      # name of env var
+          server-password: JFROG_TOKEN     # name of env var
 
       - name: Toolchain versions
         shell: bash
@@ -66,23 +59,22 @@ jobs:
           java -version
           mvn -version
 
-      - name: Build timestamp & short commit (from last commit)
+      - name: Build timestamp & short commit
         id: ts
         shell: bash
         run: |
           set -euo pipefail
           COMMIT_TS=$(git log -1 --format=%ct)
           echo "iso=$(date -u -d @${COMMIT_TS} +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
-          echo "compact=$(date -u -d @${COMMIT_TS} +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
           echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
-      - name: Set version to include commit id (…-g<sha>-SNAPSHOT)
+      - name: Set version to …-g<sha>-SNAPSHOT
         id: ver
         shell: bash
         run: |
           set -euo pipefail
           CURR=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)
-          BASE="${CURR%-SNAPSHOT}"                          # drop -SNAPSHOT if present
+          BASE="${CURR%-SNAPSHOT}"
           NEW="${BASE}-g${{ steps.ts.outputs.short_sha }}-SNAPSHOT"
           echo "Setting version: ${NEW}"
           mvn -q -DgenerateBackupPoms=false versions:set -DnewVersion="${NEW}"
@@ -111,7 +103,7 @@ jobs:
           jf c use art
           mkdir -p target/xray
 
-      - name: Xray dependency audit (Maven) — non-blocking
+      - name: Xray dependency audit — non-blocking
         continue-on-error: true
         shell: bash
         run: |
@@ -135,20 +127,22 @@ jobs:
           path: |
             target/xray/xray-deps.json
             target/xray/xray-jar.json
-      # -----------------------------------------
 
+      # ---------- DEPLOY ----------
       - name: Deploy to Artifactory (snapshot repo)
         shell: bash
         run: |
           set -euo pipefail
           DEPLOY_URL="${JF_URL%/}/artifactory/${SNAP_REPO}"
           echo "Deploying to: ${DEPLOY_URL}"
+          # The 3-segment form with 'default' is what works reliably in your env
           mvn $MVN_FLAGS \
             -Dproject.build.outputTimestamp="${{ steps.ts.outputs.iso }}" \
             -DaltDeploymentRepository=artifactory::default::"${DEPLOY_URL}" \
             deploy
 
-      - name: Resolve remote snapshot filename from maven-metadata.xml
+      # ---------- Resolve remote unique SNAPSHOT name ----------
+      - name: Resolve remote snapshot filename (maven-metadata.xml)
         id: remotename
         shell: bash
         env:
@@ -161,7 +155,7 @@ jobs:
           BASE="${NEW_VERSION%-SNAPSHOT}"
           META_URL="${JF_URL%/}/artifactory/${SNAP_REPO}/${GROUP_PATH}/${AID}/${NEW_VERSION}/maven-metadata.xml"
           echo "Fetching metadata: ${META_URL}"
-          # small retry in case metadata isn't ready immediately
+          # retry a few times — metadata can lag immediately after deploy
           for i in 1 2 3 4 5; do
             META_XML=$(curl -sS -u "${JFROG_USER}:${JFROG_TOKEN}" -H "Accept: application/xml" "$META_URL" || true)
             ONE=$(echo "$META_XML" | tr -d '\n')
@@ -169,8 +163,8 @@ jobs:
             if [ -n "$UNIQ" ]; then
               REMOTE_FILE="${AID}-${UNIQ}.jar"; break
             fi
-            TS=$(echo "$META_XML" | sed -n 's:.*<timestamp>\(.*\)</timestamp>.*:\1:p' | head -n1)
-            BN=$(echo "$META_XML" | sed -n 's:.*<buildNumber>\(.*\)</buildNumber>.*:\1:p' | head -n1)
+            TS=$(echo "$ONE" | sed -n 's:.*<timestamp>\(.*\)</timestamp>.*:\1:p' | head -n1)
+            BN=$(echo "$ONE" | sed -n 's:.*<buildNumber>\(.*\)</buildNumber>.*:\1:p' | head -n1)
             if [ -n "$TS" ] && [ -n "$BN" ]; then
               REMOTE_FILE="${AID}-${BASE}-${TS}-${BN}.jar"; break
             fi
@@ -181,7 +175,8 @@ jobs:
           echo "group_path=${GROUP_PATH}"   >> "$GITHUB_OUTPUT"
           echo "artifact_id=${AID}"         >> "$GITHUB_OUTPUT"
 
-      - name: Make local copy + sha256 (named exactly like remote)
+      # ---------- Local copy named like remote + checksum ----------
+      - name: Make local copy + sha256 (named like remote)
         id: stage
         shell: bash
         env:
@@ -195,7 +190,8 @@ jobs:
           echo "out_name=${REMOTE_NAME}" >> "$GITHUB_OUTPUT"
           echo "local_sha256=$(cut -d' ' -f1 ${ARTIFACT_DIR}/${REMOTE_NAME}.sha256)" >> "$GITHUB_OUTPUT"
 
-      - name: Validate checksum with Artifactory (HEAD header)
+      # ---------- Checksum parity using HEAD header ----------
+      - name: Validate checksum with Artifactory (X-Checksum-Sha256)
         shell: bash
         env:
           GROUP_PATH:  ${{ steps.remotename.outputs.group_path }}
@@ -217,13 +213,13 @@ jobs:
             sleep 2
           done
           [ -n "$REMOTE_SHA256" ] || { echo "::error::Could not obtain X-Checksum-Sha256."; exit 1; }
-          LOCAL_SHA256=$(cut -d' ' -f1 "${ARTIFACT_DIR}/${LOCAL_NAME}.sha256")
+          LOCAL_SHA256=$(cut -d' ' -f1 "${ARTIFACT_DIR}/${LOCAL_NAME}.sha256}")
           echo "Remote sha256: $REMOTE_SHA256"
           echo "Local  sha256: $LOCAL_SHA256"
           [ "$REMOTE_SHA256" = "$LOCAL_SHA256" ] || { echo "::error::Checksum mismatch."; exit 1; }
           echo "Checksum match ✅"
 
-      - name: Upload artifact (local copy + sha256 + Xray JSON)
+      - name: Upload artifact bundle (local copy + sha256 + Xray JSON)
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.stage.outputs.out_name }}
