@@ -20,7 +20,7 @@ jobs:
     env:
       # ---- Variables (set these in GitHub Settings → Variables) ----
       JF_URL:        ${{ vars.JF_URL }}            # e.g., https://chirag095.jfrog.io
-      MAVEN_REPO:    ${{ vars.JF_MVN_SNAPSHOTS_REPO }}        # e.g., demo-libs-snapshot (must allow -SNAPSHOT)
+      MAVEN_REPO:    ${{ vars.MAVEN_REPO }}        # e.g., demo-libs-snapshot (must allow -SNAPSHOT)
       MVN_FLAGS:     -B -ntp -e -V                 # batch, no transfer progress, show errors & versions
 
       # ---- Secrets mapped to env (as requested; don't reference secrets directly later) ----
