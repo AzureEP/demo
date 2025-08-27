@@ -1,12 +1,11 @@
 # .github/workflows/publish.yml
-# SIMPLE + XRAY (NON-BLOCKING) — FIXED JFROG CLI CONFIG:
-# - Build & test (reproducible)
-# - Version bumped to include commit id (…-g<sha>-SNAPSHOT)
-# - Run JFrog Xray audits/scans but DO NOT fail the pipeline (non-blocking)
+# Build & Publish with non-blocking Xray + checksum parity
+# - Reproducible build; version includes commit (…-g<sha>-SNAPSHOT)
+# - Xray audits/scans (non-blocking) -> JSON saved under target/xray/
 # - Deploy to Artifactory snapshot repo
-# - Resolve remote snapshot filename, make a local copy with the same name + .sha256
-# - Validate checksum parity (remote vs local) via HEAD header
-# - Upload local copy + checksum + Xray JSON reports as workflow artifacts
+# - Resolve remote snapshot filename; create local copy named exactly like remote + .sha256
+# - Verify remote vs local checksum via Artifactory HEAD header
+# - Upload local copy + checksum + Xray JSONs as workflow artifacts
 
 name: Build and Publish to JFrog Artifactory (with non-blocking Xray)
 
@@ -40,6 +39,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      # Clean any leftover scan files so Checkstyle NoHttp won't see them
+      - name: Pre-clean scan outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f xray-*.json || true
+          rm -rf target/xray || true
 
       # Writes ~/.m2/settings.xml with <server id="artifactory"> using ENV VAR NAMES below
       - name: Setup JDK 17 + Maven server creds
@@ -95,7 +102,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Add server config with ID 'art' and set it as current (no deprecated flags)
           jf c add art \
             --interactive=false \
             --url "${JF_URL}" \
@@ -103,15 +109,14 @@ jobs:
             --password "${JFROG_TOKEN}" \
             --overwrite=true
           jf c use art
-          jf --version
-          jf c show art
+          mkdir -p target/xray
 
       - name: Xray dependency audit (Maven) — non-blocking
         continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
-          jf audit --mvn --format=json > xray-deps.json || true
+          jf audit --mvn --format=json > target/xray/xray-deps.json || true
           echo "Dependency audit completed (non-blocking)."
 
       - name: Xray binary scan (built JAR) — non-blocking
@@ -119,7 +124,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          jf scan "target/*.jar" --format=json > xray-jar.json || true
+          jf scan "target/*.jar" --format=json > target/xray/xray-jar.json || true
           echo "Binary scan completed (non-blocking)."
 
       - name: Upload Xray JSON reports
@@ -128,8 +133,8 @@ jobs:
         with:
           name: xray-json-${{ github.sha }}
           path: |
-            xray-deps.json
-            xray-jar.json
+            target/xray/xray-deps.json
+            target/xray/xray-jar.json
       # -----------------------------------------
 
       - name: Deploy to Artifactory (snapshot repo)
@@ -224,5 +229,5 @@ jobs:
           name: ${{ steps.stage.outputs.out_name }}
           path: |
             ${{ env.ARTIFACT_DIR }}/*
-            xray-deps.json
-            xray-jar.json
+            target/xray/xray-deps.json
+            target/xray/xray-jar.json
