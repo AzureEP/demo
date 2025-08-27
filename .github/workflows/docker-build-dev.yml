@@ -1,0 +1,94 @@
+name: Docker — Build & Push (dev)
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docker-build-dev:
+    runs-on: ubuntu-latest
+
+    env:
+      # Set these in repo Settings → Variables
+      JF_URL:              ${{ vars.JF_URL }}                 # e.g., https://chirag095.jfrog.io
+      JF_DOCKER_REGISTRY:  ${{ vars.JF_DOCKER_REGISTRY }}     # e.g., chirag095.jfrog.io
+      DOCKER_DEV_REPO:     ${{ vars.DOCKER_DEV_REPO }}        # e.g., docker-petclinic-dev
+      DOCKER_PROD_REPO:    ${{ vars.DOCKER_PROD_REPO }}       # e.g., docker-petclinic-prod
+      IMAGE_NAME:          spring-petclinic
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Derive build metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          TS=$(git log -1 --format=%ct)
+          ISO=$(date -u -d @${TS} +%Y-%m-%dT%H:%M:%SZ)
+          SHA=${GITHUB_SHA::7}
+          BRANCH="${GITHUB_REF_NAME}"
+          echo "iso=${ISO}"       >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA}"       >> "$GITHUB_OUTPUT"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to JFrog Docker registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.JF_DOCKER_REGISTRY }}
+          username: ${{ secrets.JFROG_USER }}
+          password: ${{ secrets.JFROG_TOKEN }}
+
+      - name: Build & push (dev)
+        env:
+          TAG1: ${{ env.JF_DOCKER_REGISTRY }}/${{ env.DOCKER_DEV_REPO }}/${{ env.IMAGE_NAME }}:git-${{ steps.meta.outputs.sha }}
+          TAG2: ${{ env.JF_DOCKER_REGISTRY }}/${{ env.DOCKER_DEV_REPO }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.branch }}-latest
+        run: |
+          set -euo pipefail
+          echo "Pushing:"
+          echo " - $TAG1"
+          echo " - $TAG2"
+          docker buildx build \
+            --platform linux/amd64 \
+            --build-arg BUILD_TS="${{ steps.meta.outputs.iso }}" \
+            --build-arg VCS_REF="${GITHUB_SHA}" \
+            --build-arg REPO_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            -t "$TAG1" -t "$TAG2" \
+            --push .
+
+      - name: Fetch dev image digest (audit)
+        id: digest
+        env:
+          IMAGE_REF: ${{ env.JF_DOCKER_REGISTRY }}/${{ env.DOCKER_DEV_REPO }}/${{ env.IMAGE_NAME }}:git-${{ steps.meta.outputs.sha }}
+        run: |
+          set -euo pipefail
+          REPO="${{ env.DOCKER_DEV_REPO }}"
+          NAME="${{ env.IMAGE_NAME }}"
+          TAG="git-${{ steps.meta.outputs.sha }}"
+          URL="${{ env.JF_URL }}/artifactory/api/docker/${REPO}/v2/${NAME}/manifests/${TAG}"
+          HDRS=$(curl -sSI -u "${{ secrets.JFROG_USER }}:${{ secrets.JFROG_TOKEN }}" "$URL")
+          DIGEST=$(echo "$HDRS" | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' | tail -n1)
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Dev image digest: ${DIGEST}"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Dev image published"
+            echo "- Registry: \`${{ env.JF_DOCKER_REGISTRY }}\`"
+            echo "- Repo: \`${{ env.DOCKER_DEV_REPO }}\`"
+            echo "- Image: \`${{ env.IMAGE_NAME }}\`"
+            echo "- Tags:"
+            echo "  - \`${{ env.JF_DOCKER_REGISTRY }}/${{ env.DOCKER_DEV_REPO }}/${{ env.IMAGE_NAME }}:git-${{ steps.meta.outputs.sha }}\`"
+            echo "  - \`${{ env.JF_DOCKER_REGISTRY }}/${{ env.DOCKER_DEV_REPO }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.branch }}-latest\`"
+            echo "- Digest: \`${{ steps.digest.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
