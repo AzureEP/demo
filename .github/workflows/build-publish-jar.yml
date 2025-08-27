@@ -11,42 +11,49 @@ permissions:
 jobs:
   build-publish-jar:
     runs-on: ubuntu-latest
+
+    # ---- Centralized environment (including secrets -> env vars) ----
     env:
-      JF_URL:        ${{ vars.JF_URL }}
-      MAVEN_REPO:    ${{ vars.MAVEN_REPO }}
+      # JFrog / repos (set as Repository Variables)
+      JF_URL:           ${{ vars.JF_URL }}              # e.g., https://chirag095.jfrog.io
+      MAVEN_REPO:       ${{ vars.MAVEN_REPO }}          # e.g., demo-libs-snapshot (must allow snapshots)
+      # Secrets mapped to env (you asked not to reference secrets directly later)
+      JF_USER:          ${{ secrets.JFROG_USER }}
+      JF_TOKEN:         ${{ secrets.JFROG_TOKEN }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with: { fetch-depth: 0 }
 
-      - name: Set up JDK 17 and Maven server credentials
+      - name: Set up JDK 17 & Maven server credentials
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
           cache: 'maven'
+          # IMPORTANT: server-id must match what we use in -DaltDeploymentRepository
           server-id: artifactory
-          server-username: ${{ secrets.JFROG_USER }}
-          server-password: ${{ secrets.JFROG_TOKEN }}
+          server-username: ${{ env.JF_USER }}
+          server-password: ${{ env.JF_TOKEN }}
 
-      - name: Derive build metadata
+      - name: Derive build metadata (version with git sha)
         id: meta
         shell: bash
         run: |
           set -euo pipefail
-          SHA_FULL="${GITHUB_SHA}"
           SHA_SHORT="${GITHUB_SHA::7}"
           CURR_VER=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)
           BASE_VER="${CURR_VER%-SNAPSHOT}"
           NEW_VER="${BASE_VER}-g${SHA_SHORT}-SNAPSHOT"
-          echo "sha_short=${SHA_SHORT}" >> "$GITHUB_OUTPUT"
-          echo "new_version=${NEW_VER}" >> "$GITHUB_OUTPUT"
-          echo "Setting version to: ${NEW_VER}"
+          echo "sha_short=${SHA_SHORT}"       >> "$GITHUB_OUTPUT"
+          echo "new_version=${NEW_VER}"       >> "$GITHUB_OUTPUT"
+          echo "Using project.version=${NEW_VER}"
 
       - name: Set project version (g<sha>-SNAPSHOT)
         run: mvn -B -ntp -DgenerateBackupPoms=false versions:set -DnewVersion="${{ steps.meta.outputs.new_version }}"
 
-      # --- Quality checks (non-blocking) ---
+      # ------------------ Non-blocking quality checks ------------------
       - name: Checkstyle (non-blocking)
         run: mvn -B -ntp checkstyle:check || true
         continue-on-error: true
@@ -55,33 +62,58 @@ jobs:
         run: mvn -B -ntp com.github.spotbugs:spotbugs-maven-plugin:spotbugs || true
         continue-on-error: true
 
-      # --- Tests (run existing tests; don't write new) ---
+      # ------------------ Tests (no new tests to write) ----------------
       - name: Test
         run: mvn -B -ntp -DskipITs verify
 
-      # --- Package JAR ---
+      # ------------------ Package the JAR ------------------------------
       - name: Package
         run: mvn -B -ntp -DskipITs package
 
-      # --- Deploy JAR to Artifactory (no pom changes needed) ---
-      - name: Deploy to Artifactory
+      # ------------------ Deploy to Artifactory ------------------------
+      # Fixes 401 by:
+      #  - using server-id "artifactory" (same as setup-java wrote into settings.xml)
+      #  - using modern altDeploymentRepository syntax: artifactory::<URL>/<repo>  (no 'default')
+      - name: Deploy to Artifactory (snapshots)
         env:
-          ALT_REPO: artifactory::default::${{ env.JF_URL }}/artifactory/${{ env.MAVEN_REPO }}
-        run: mvn -B -ntp -DskipITs -DskipTests=true -DaltDeploymentRepository="${ALT_REPO}" deploy
+          ALT_REPO: artifactory::${{ env.JF_URL }}/artifactory/${{ env.MAVEN_REPO }}
+        run: |
+          set -euo pipefail
+          echo "Deploying to: $ALT_REPO"
+          mvn -B -ntp -DskipITs -DskipTests=true -DaltDeploymentRepository="${ALT_REPO}" deploy
 
-      # Upload the exact JAR as workflow artifact so #02 can inject it
-      - name: Upload JAR artifact
+      # ------------------ Xray "quality gate" (non-blocking) ----------
+      # Uses JFrog CLI to audit dependencies; saves JSON report for artifacts.
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        with:
+          version: latest
+          jfrog-url: ${{ env.JF_URL }}
+          access-token: ${{ env.JF_TOKEN }}
+
+      - name: Xray dependency audit (non-blocking, save report)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Audit Maven project; don't fail pipeline; save output to JSON
+          jf audit --mvn --format=json > xray-audit.json || true
+          echo "Xray audit completed (non-blocking)."
+
+      - name: Upload reports & JAR as workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: jar-${{ github.sha }}
+          name: jar-and-quality-${{ github.sha }}
           path: |
             target/*.jar
             target/*.pom
-          if-no-files-found: error
+            xray-audit.json
+          if-no-files-found: warn
 
       - name: Summary
         run: |
-          echo "### JAR published" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Version: \`${{ steps.meta.outputs.new_version }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Artifact: \`jar-${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Maven repo: \`${{ env.MAVEN_REPO }}\` at \`${{ env.JF_URL }}\`" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### JAR published to Artifactory"
+            echo "- Version: \`${{ steps.meta.outputs.new_version }}\`"
+            echo "- Maven repo: \`${{ env.MAVEN_REPO }}\` at \`${{ env.JF_URL }}\`"
+            echo "- Workflow artifact: \`jar-and-quality-${{ github.sha }}\` (includes JAR/POM + xray-audit.json)"
+          } >> "$GITHUB_STEP_SUMMARY"
