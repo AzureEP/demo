@@ -1,11 +1,11 @@
 # Filename: .github/workflows/publish.yml
-# FINAL RECOMMENDED VERSION
+# FINAL — Build & Publish Maven JAR to JFrog Artifactory (no distributionManagement)
 
 name: Build and Publish to JFrog Artifactory
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch:
 
 permissions:
@@ -18,7 +18,9 @@ jobs:
 
     env:
       ARTIFACT_DIR: dist
-      MVN_FLAGS: "-B -ntp -C -V -e"  # batch, no transfer progress, checksum, show versions, show stacktraces
+      # Batch (-B), no transfer progress (-ntp), strict checksums (-C),
+      # show plugin/tool versions (-V), show stacktraces on error (-e)
+      MVN_FLAGS: "-B -ntp -C -V -e"
 
     steps:
       - name: Checkout repository
@@ -26,15 +28,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up JDK 17 and Maven settings.xml
+      - name: Set up JDK 17 and write Maven server credentials
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
-          distribution: 'temurin'
-          cache: 'maven'
-          # This writes a <server> entry into ~/.m2/settings.xml with this ID:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+          # This creates ~/.m2/settings.xml with a <server><id>artifactory</id>...</server>
           server-id: artifactory
-          # Read from GitHub SECRETS (correct contexts)
           server-username: ${{ secrets.JFROG_USER }}
           server-password: ${{ secrets.JFROG_TOKEN }}
 
@@ -51,76 +52,29 @@ jobs:
           TS=$(git log -1 --format=%ct)
           echo "build_ts=$(date -u -d @${TS} +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
-      - name: DEBUG — Inspect Maven settings (temporary)
+      - name: DEBUG — Inspect ~/.m2/settings.xml (sanitized)
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           echo "--- ~/.m2 directory:"
           ls -la ~/.m2/ || true
-          echo "--- ~/.m2/settings.xml (secrets masked by GitHub):"
-          sed -e 's/<password>.*<\/password>/<password>***MASKED***<\/password>/g' ~/.m2/settings.xml || true
+          echo "--- ~/.m2/settings.xml (password masked):"
+          sed -E 's#(<password>).*?(</password>)#\1***MASKED***\2#g' ~/.m2/settings.xml || true
+          echo "--- Verify server id present:"
+          grep -n "<id>artifactory</id>" ~/.m2/settings.xml || (echo "Server id 'artifactory' not found!" && exit 1)
 
-      - name: Compute deploy repository URL (snapshots vs releases)
+      - name: Resolve project version and choose target repo (snapshot vs release)
         id: repo
         env:
-          JF_URL: ${{ vars.JF_URL }}
-          SNAP_REPO: ${{ vars.JF_MVN_SNAPSHOTS_REPO }}
-          REL_REPO: ${{ vars.JF_MVN_RELEASES_REPO }}
+          JF_URL: ${{ vars.JF_URL }}                       # e.g., https://yourorg.jfrog.io
+          SNAP_REPO: ${{ vars.JF_MVN_SNAPSHOTS_REPO }}     # e.g., maven-snapshots-local
+          REL_REPO:  ${{ vars.JF_MVN_RELEASES_REPO }}      # e.g., maven-releases-local
         run: |
           set -euo pipefail
-          APP_VER=$(mvn -q -Dexec.executable=echo -Dexec.args='${project.version}' --non-recursive exec:exec)
+          APP_VER=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)
           echo "Detected project.version=${APP_VER}"
-          if [[ "${APP_VER}" == *-SNAPSHOT ]]; then
-            REPO="${SNAP_REPO}"
-          else
-            REPO="${REL_REPO}"
-          fi
-          DEPLOY_URL="${JF_URL%/}/artifactory/${REPO}"
-          echo "Using Artifactory repo: ${REPO}"
-          echo "Deploy URL: ${DEPLOY_URL}"
-          echo "deploy_url=${DEPLOY_URL}" >> "$GITHUB_OUTPUT"
-
-      - name: Build (reproducible) and run tests
-        run: |
-          set -euo pipefail
-          mvn $MVN_FLAGS -Dproject.build.outputTimestamp="${{ steps.ts.outputs.build_ts }}" clean verify
-
-      - name: Stage artifacts, checksums
-        run: |
-          set -euo pipefail
-          mkdir -p "$ARTIFACT_DIR"
-          JAR_PATH=$(ls target/*.jar | head -n1)
-          cp "${JAR_PATH}" "${ARTIFACT_DIR}/app.jar"
-          (cd "$ARTIFACT_DIR" && sha256sum app.jar > app.jar.sha256)
-          (cd "$ARTIFACT_DIR" && sha512sum app.jar > app.jar.sha512)
-          echo "Staged:"
-          ls -lah "$ARTIFACT_DIR"
-
-      - name: Deploy JAR to Artifactory (Maven deploy with altDeploymentRepository)
-        env:
-          DEPLOY_URL: ${{ steps.repo.outputs.deploy_url }}
-        run: |
-          set -euo pipefail
-          # The server-id (artifactory) MUST match the <server> created by setup-java
-          mvn $MVN_FLAGS -DaltDeploymentRepository=artifactory::default::"${DEPLOY_URL}" deploy
-
-      - name: Upload build artifacts (logs, jar, checksums)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: jar-and-logs-${{ github.sha }}
-          path: |
-            ${{ env.ARTIFACT_DIR }}/app.jar
-            ${{ env.ARTIFACT_DIR }}/app.jar.sha256
-            ${{ env.ARTIFACT_DIR }}/app.jar.sha512
-            ~/.m2/settings.xml
-
-      # Optional: extra debug on failure (rerun key phases with -X for deep logs)
-      - name: DEBUG — Deep Maven logs (only on failure)
-        if: failure()
-        env:
-          DEPLOY_URL: ${{ steps.repo.outputs.deploy_url }}
-        run: |
-          set +e
-          echo "Re-running key steps with -X for diagnostics..."
-          mvn -X -ntp -Dproject.build.outputTimestamp="${{ steps.ts.outputs.build_ts }}" clean package || true
-          mvn -X -ntp -DaltDeploymentRepository=artifactory::default::"${DEPLOY_URL}" deploy -DskipTests || true
+          case "${APP_VER}" in
+            *-SNAPSHOT) REPO="${SNAP_REPO}" ;;
+            *)          REPO="${REL_REPO}" ;;
+          esac
+          if [[ -z "${JF_URL}" || -z "${REPO}" ]]; then
+            e
