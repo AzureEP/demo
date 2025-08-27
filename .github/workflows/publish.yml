@@ -1,0 +1,32 @@
+# Filename: .github/workflows/publish.yml
+
+name: Build and Publish to JFrog Artifactory
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Important for the git-commit-id plugin
+
+      - name: Set up JDK 17 and Maven settings.xml
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'maven'
+          server-id: snapshots # This MUST match the <id> in your pom.xml
+          server-username: ${{ secrets.JFROG_USER }}
+          server-password: ${{ secrets.JFROG_TOKEN }}
+
+      - name: Build and Deploy with Maven
+        run: mvn -B deploy
+        env:
+          JFROG_URL: ${{ secrets.JFROG_URL }}
