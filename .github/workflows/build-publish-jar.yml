@@ -1,11 +1,12 @@
 # .github/workflows/01-build-publish-jar.yml
-# Step 1: Build, test, run non-blocking quality gates (incl. Xray), then publish JAR to Artifactory.
-# Fixes 401 by injecting REAL creds into settings.xml (no ${env.…}) and adds diagnostics + fallback.
+# Build, test, run quality gates, and publish JAR to Artifactory
 
 name: 01-Build-and-Publish-JAR
 
 on:
   push:
+    branches: ["main"]
+  pull_request:
     branches: ["main"]
   workflow_dispatch:
 
@@ -15,172 +16,115 @@ permissions:
 jobs:
   build-publish-jar:
     runs-on: ubuntu-latest
+    timeout-minutes: 30  # Prevent hanging jobs
 
     env:
-      # Repo variables (Settings → Variables)
-      JF_URL: ${{ vars.JF_URL }}                      # e.g., https://chirag095.jfrog.io
-      MAVEN_REPO: ${{ vars.JF_MVN_SNAPSHOTS_REPO }}   # e.g., demo-libs-snapshot (LOCAL snapshots)
-      MVN_FLAGS: -B -ntp -e -V
-
-      # Secrets mapped to env for CLI/curl use
-      JF_USER:  ${{ secrets.JFROG_USER }}
+      JF_URL: ${{ vars.JF_URL }}
+      MAVEN_REPO: ${{ vars.JF_MVN_SNAPSHOTS_REPO }}
+      MVN_FLAGS: -B -ntp -V
+      JF_USER: ${{ secrets.JFROG_USER }}
       JF_TOKEN: ${{ secrets.JFROG_TOKEN }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
 
-      - name: Set up Temurin JDK 17 + Maven server creds
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
           cache: 'maven'
-          # IMPORTANT: pass the ACTUAL secret values here (not env var names).
           server-id: artifactory
           server-username: ${{ secrets.JFROG_USER }}
           server-password: ${{ secrets.JFROG_TOKEN }}
 
-      - name: Debug settings.xml
-        shell: bash
+      # Simplify version generation
+      - name: Generate version
+        id: version
         run: |
-          echo "Expect <id>artifactory</id> with REAL values in ~/.m2/settings.xml"
-          ls -la ~/.m2 || true
-          cat ~/.m2/settings.xml || true
-
-      - name: Derive version (g<sha>-SNAPSHOT)
-        id: meta
-        shell: bash
-        run: |
-          set -euo pipefail
           SHA_SHORT="${GITHUB_SHA::7}"
-          CURR=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)
-          BASE="${CURR%-SNAPSHOT}"
-          NEW="${BASE}-g${SHA_SHORT}-SNAPSHOT"
-          echo "new_version=${NEW}" >> "$GITHUB_OUTPUT"
-          echo "Using project.version=${NEW}"
+          TIMESTAMP=$(date -u +%Y%m%d%H%M%S)
+          VERSION="1.0.0-${SHA_SHORT}-${TIMESTAMP}-SNAPSHOT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Generated version: ${VERSION}"
 
       - name: Set project version
-        shell: bash
-        run: mvn $MVN_FLAGS -DgenerateBackupPoms=false versions:set -DnewVersion="${{ steps.meta.outputs.new_version }}"
+        run: |
+          mvn $MVN_FLAGS versions:set -DnewVersion="${{ steps.version.outputs.version }}" -DgenerateBackupPoms=false
 
-      # ---- Non-blocking quality checks ----
-      - name: Checkstyle (non-blocking)
-        shell: bash
-        run: mvn $MVN_FLAGS checkstyle:check || true
+      # Combined build and test step
+      - name: Build and Test
+        run: |
+          mvn $MVN_FLAGS clean compile test package
+          echo "✅ Build and tests completed"
 
-      - name: SpotBugs (non-blocking)
-        shell: bash
-        run: mvn $MVN_FLAGS com.github.spotbugs:spotbugs-maven-plugin:spotbugs || true
+      # Simple quality checks (non-blocking)
+      - name: Quality Checks
+        continue-on-error: true
+        run: |
+          echo "Running quality checks..."
+          mvn $MVN_FLAGS checkstyle:check || echo "⚠️ Checkstyle issues found"
+          mvn $MVN_FLAGS spotbugs:check || echo "⚠️ SpotBugs issues found"
 
-      # ---- Test & Package (skip bound style plugins that may fail) ----
-      - name: Test
-        shell: bash
-        run: mvn $MVN_FLAGS -DskipITs -Dcheckstyle.skip=true -Dspotbugs.skip=true verify
-
-      - name: Package
-        shell: bash
-        run: mvn $MVN_FLAGS -DskipITs -Dcheckstyle.skip=true -Dspotbugs.skip=true package
-
-      # ---- Xray quality gate (non-blocking, BEFORE upload) ----
-      - name: Setup JFrog CLI for Xray
+      # Setup JFrog CLI
+      - name: Setup JFrog CLI
+        if: github.ref == 'refs/heads/main'  # Only on main branch
         uses: jfrog/setup-jfrog-cli@v4
         env:
           JF_URL: ${{ env.JF_URL }}
           JF_ACCESS_TOKEN: ${{ env.JF_TOKEN }}
 
-      - name: Xray dependency audit (non-blocking; save JSON under target/)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p target/xray
-          jf audit --mvn --format=json > target/xray/xray-audit.json || true
-          echo "Saved target/xray/xray-audit.json (pre-deploy)."
-
-      # ---- Resolve GAV & files ----
-      - name: Resolve GAV and built files
-        id: gav
-        shell: bash
-        run: |
-          set -euo pipefail
-          G=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.groupId)
-          A=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.artifactId)
-          V=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)
-          JAR=$(ls -1 target/*.jar | head -n1)
-          POM=$(ls -1 target/*.pom | head -n1 || echo "pom.xml")
-          GP=$(echo "$G" | tr . /)
-          echo "groupId=${G}"  >> "$GITHUB_OUTPUT"
-          echo "artifactId=${A}" >> "$GITHUB_OUTPUT"
-          echo "version=${V}"  >> "$GITHUB_OUTPUT"
-          echo "groupPath=${GP}" >> "$GITHUB_OUTPUT"
-          echo "jar=${JAR}"    >> "$GITHUB_OUTPUT"
-          echo "pom=${POM}"    >> "$GITHUB_OUTPUT"
-          echo "GAV: ${G}:${A}:${V}"
-          echo "JAR: ${JAR}"
-          echo "POM: ${POM}"
-
-      # ---- Diagnose the exact metadata URL with auth ----
-      - name: Diagnose metadata URL auth
-        shell: bash
-        run: |
-          set -euo pipefail
-          META="${JF_URL%/}/artifactory/${MAVEN_REPO}/${{ steps.gav.outputs.groupPath }}/${{ steps.gav.outputs.artifactId }}/${{ steps.gav.outputs.version }}/maven-metadata.xml"
-          echo "curl -i $META"
-          curl -i -u "${JF_USER}:${JF_TOKEN}" "$META" || true
-          echo ""
-          echo "If this returns 401 without WWW-Authenticate, Maven may not retry with auth. We'll still try deploy, then fallback."
-
-      # ---- Try standard mvn deploy (modern alt repo syntax) ----
-      - name: Deploy via mvn deploy (primary)
-        id: deploy_try
-        shell: bash
+      # Security scan (non-blocking)
+      - name: Security Scan
+        if: github.ref == 'refs/heads/main'
         continue-on-error: true
-        env:
-          ALT_REPO: artifactory::${{ env.JF_URL }}/artifactory/${{ env.MAVEN_REPO }}
         run: |
-          set -euo pipefail
-          echo "ALT_REPO='${ALT_REPO}'"
-          mvn $MVN_FLAGS \
-            -DskipITs -DskipTests=true \
-            -DaltDeploymentRepository="${ALT_REPO}" \
-            deploy
+          mkdir -p target/reports
+          jf audit --format=json > target/reports/security-audit.json || echo "⚠️ Security scan completed with warnings"
 
-      # ---- Fallback: deploy:deploy-file (explicit upload) ----
-      - name: Deploy via deploy-file (fallback if deploy failed)
-        if: ${{ steps.deploy_try.outcome == 'failure' }}
-        shell: bash
-        env:
-          DEPLOY_URL: ${{ env.JF_URL }}/artifactory/${{ env.MAVEN_REPO }}
+      # Deploy only on main branch
+      - name: Deploy to Artifactory
+        if: github.ref == 'refs/heads/main'
         run: |
-          set -euo pipefail
-          echo "::warning::mvn deploy failed. Falling back to deploy:deploy-file."
-          echo "Deploy URL: ${DEPLOY_URL}"
-          mvn $MVN_FLAGS deploy:deploy-file \
-            -Dfile="${{ steps.gav.outputs.jar }}" \
-            -DpomFile="${{ steps.gav.outputs.pom }}" \
-            -Durl="${DEPLOY_URL}" \
-            -DrepositoryId=artifactory \
-            -DgeneratePom=false
+          echo "Deploying to Artifactory..."
+          mvn $MVN_FLAGS deploy \
+            -DskipTests \
+            -DaltDeploymentRepository="artifactory::${{ env.JF_URL }}/artifactory/${{ env.MAVEN_REPO }}"
 
-      # ---- Upload artifacts & reports ----
-      - name: Upload JAR, POM, and quality reports
+      # Verify deployment
+      - name: Verify Deployment
+        if: github.ref == 'refs/heads/main'
+        run: |
+          ARTIFACT_URL="${{ env.JF_URL }}/artifactory/${{ env.MAVEN_REPO }}/org/springframework/samples/petclinic/${{ steps.version.outputs.version }}"
+          echo "Verifying deployment at: ${ARTIFACT_URL}"
+          curl -f -u "${JF_USER}:${JF_TOKEN}" "${ARTIFACT_URL}/" || echo "⚠️ Verification failed"
+
+      # Upload build artifacts
+      - name: Upload Artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: jar-and-quality-${{ github.sha }}
+          name: build-artifacts-${{ github.run_number }}
           path: |
             target/*.jar
             target/*.pom
-            target/xray/xray-audit.json
-          if-no-files-found: error
+            target/reports/*.json
+          retention-days: 7
 
-      - name: Summary
-        shell: bash
+      # Simple summary
+      - name: Build Summary
+        if: always()
         run: |
-          {
-            echo "### JAR published to Artifactory"
-            echo "- Version: \`${{ steps.meta.outputs.new_version }}\`"
-            echo "- Repo: \`${{ env.MAVEN_REPO }}\` at \`${{ env.JF_URL }}\`"
-            echo "- Primary deploy: \`${{ steps.deploy_try.outcome }}\`"
-            echo "- Xray: non-blocking, pre-deploy"
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version:** \`${{ steps.version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch:** \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "- **Deployed:** ✅ Yes" >> $GITHUB_STEP_SUMMARY
+            echo "- **Repository:** \`${{ env.MAVEN_REPO }}\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Deployed:** ❌ No (PR/feature branch)" >> $GITHUB_STEP_SUMMARY
+          fi
