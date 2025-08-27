@@ -1,0 +1,134 @@
+name: Docker — Promote to prod
+
+on:
+  workflow_dispatch:
+    inputs:
+      sourceTag:
+        description: "Dev tag to promote (e.g., git-104c263)"
+        required: true
+      targetTag:
+        description: "Prod tag (release version, e.g., 1.2.3). Default: same as sourceTag"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    environment:
+      name: prod   # Set approvals in GitHub → Settings → Environments → prod
+
+    env:
+      # Variables
+      JF_URL:              ${{ vars.JF_URL }}                 # https://chirag095.jfrog.io
+      JF_DOCKER_REGISTRY:  ${{ vars.JF_DOCKER_REGISTRY }}     # chirag095.jfrog.io
+      DOCKER_DEV_REPO:     ${{ vars.DOCKER_DEV_REPO }}        # docker-petclinic-dev
+      DOCKER_PROD_REPO:    ${{ vars.DOCKER_PROD_REPO }}       # docker-petclinic-prod
+      IMAGE_NAME:          spring-petclinic
+
+    steps:
+      - name: Checkout (to resolve commit SHA)
+        uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Promote via Artifactory Docker Promote API
+        id: promote
+        run: |
+          set -euo pipefail
+          SRC="${{ github.event.inputs.sourceTag }}"
+          TGT="${{ github.event.inputs.targetTag || github.event.inputs.sourceTag }}"
+          BODY=$(cat <<JSON
+          {
+            "targetRepo": "${{ env.DOCKER_PROD_REPO }}",
+            "dockerRepository": "${{ env.IMAGE_NAME }}",
+            "tag": "${SRC}",
+            "targetTag": "${TGT}",
+            "copy": true
+          }
+JSON
+)
+          URL="${{ env.JF_URL }}/artifactory/api/docker/${{ env.DOCKER_DEV_REPO }}/v2/promote"
+          echo "POST $URL"
+          curl -sS -u "${{ secrets.JFROG_USER }}:${{ secrets.JFROG_TOKEN }}" \
+               -H "Content-Type: application/json" \
+               -d "$BODY" \
+               "$URL" -o /tmp/resp.json
+          echo "Response:"; cat /tmp/resp.json
+
+      - name: Verify digest parity (dev vs prod)
+        id: digests
+        run: |
+          set -euo pipefail
+          SRC="${{ github.event.inputs.sourceTag }}"
+          TGT="${{ github.event.inputs.targetTag || github.event.inputs.sourceTag }}"
+          dev_url="${{ env.JF_URL }}/artifactory/api/docker/${{ env.DOCKER_DEV_REPO }}/v2/${{ env.IMAGE_NAME }}/manifests/${SRC}"
+          prod_url="${{ env.JF_URL }}/artifactory/api/docker/${{ env.DOCKER_PROD_REPO }}/v2/${{ env.IMAGE_NAME }}/manifests/${TGT}"
+          dev_hdrs=$(curl -sSI -u "${{ secrets.JFROG_USER }}:${{ secrets.JFROG_TOKEN }}" "$dev_url")
+          prod_hdrs=$(curl -sSI -u "${{ secrets.JFROG_USER }}:${{ secrets.JFROG_TOKEN }}" "$prod_url")
+          dev_digest=$(echo "$dev_hdrs"  | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' | tail -n1)
+          prod_digest=$(echo "$prod_hdrs" | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' | tail -n1)
+          echo "dev_digest=${dev_digest}"   >> "$GITHUB_OUTPUT"
+          echo "prod_digest=${prod_digest}" >> "$GITHUB_OUTPUT"
+          echo "Dev  digest: $dev_digest"
+          echo "Prod digest: $prod_digest"
+          if [ -z "$dev_digest" ] || [ -z "$prod_digest" ]; then
+            echo "::error::Could not fetch Docker-Content-Digest headers."; exit 1
+          fi
+          if [ "$dev_digest" != "$prod_digest" ]; then
+            echo "::error::Digest mismatch after promotion."; exit 1
+          fi
+          echo "Promotion OK — digests match ✅"
+
+      - name: Create release mapping JSON
+        id: mapping
+        shell: bash
+        env:
+          SRC_TAG:   ${{ github.event.inputs.sourceTag }}      # e.g., git-104c263
+          TGT_TAG:   ${{ github.event.inputs.targetTag || github.event.inputs.sourceTag }}  # e.g., 1.2.3
+          IMAGE:     ${{ env.IMAGE_NAME }}
+          DEV_REPO:  ${{ env.DOCKER_DEV_REPO }}
+          PROD_REPO: ${{ env.DOCKER_PROD_REPO }}
+          JF_URL:    ${{ env.JF_URL }}
+        run: |
+          set -euo pipefail
+          # Extract short commit from sourceTag (expects git-<shortsha>)
+          SHORT="${SRC_TAG#git-}"
+          # Resolve to full commit in this repo
+          FULL=$(git rev-parse --verify "${SHORT}^{commit}") || FULL="$SHORT"
+          # Digests from previous step
+          DEV_DIG="${{ steps.digests.outputs.dev_digest }}"
+          PRD_DIG="${{ steps.digests.outputs.prod_digest }}"
+          printf '%s\n' "{
+            \"version\": \"${TGT_TAG}\",
+            \"commit\":  \"${FULL}\",
+            \"image\":   \"${IMAGE}\",
+            \"dev\":  { \"repo\": \"${DEV_REPO}\",  \"tag\": \"${SRC_TAG}\", \"digest\": \"${DEV_DIG}\" },
+            \"prod\": { \"repo\": \"${PROD_REPO}\", \"tag\": \"${TGT_TAG}\", \"digest\": \"${PRD_DIG}\" },
+            \"ci_run\": \"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\",
+            \"created\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+          }" > release-mapping.json
+          echo "full_commit=${FULL}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release (v<version> → commit)
+        permissions:
+          contents: write
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.event.inputs.targetTag || github.event.inputs.sourceTag }}
+          target_commitish: ${{ steps.mapping.outputs.full_commit }}
+          name: Release ${{ github.event.inputs.targetTag || github.event.inputs.sourceTag }}
+          body: |
+            Release **${{ github.event.inputs.targetTag || github.event.inputs.sourceTag }}**
+            - Commit: `${{ steps.mapping.outputs.full_commit }}`
+            - Dev tag: `${{ env.DOCKER_DEV_REPO }}:${{ github.event.inputs.sourceTag }}`
+            - Prod tag: `${{ env.DOCKER_PROD_REPO }}:${{ github.event.inputs.targetTag || github.event.inputs.sourceTag }}`
+            - Digest: `${{ steps.digests.outputs.prod_digest }}`
+          files: |
+            release-mapping.json
+
+      - name: Upload mapping as workflow artifact (optional duplicate)
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-mapping-${{ github.event.inputs.targetTag || github.event.inputs.sourceTag }}
+          path: release-mapping.json
