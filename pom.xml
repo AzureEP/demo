@@ -281,13 +281,7 @@
 
     </plugins>
   </build>
-  <distributionManagement>
-    <snapshotRepository>
-        <id>snapshots</id>
-        <name>chirag095-demo-libs-snapshot-snapshots</name>
-        <url>${env.JFROG_URL}/demo-libs-snapshot</url>
-    </snapshotRepository>
-  </distributionManagement>
+
   <licenses>
     <license>
       <name>Apache License, Version 2.0</name>
