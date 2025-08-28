@@ -70,7 +70,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: sbom-${{ github.sha }}
-          path: target/cyclonedx.json
+          path: target/bom.json
           if-no-files-found: error
           retention-days: 7
 
@@ -139,7 +139,7 @@ jobs:
       - name: Upload SBOM to generic audit repo
         if: github.event_name == 'push'
         run: |
-          jf rt u "target/cyclonedx.json" "${JF_GENERIC_AUDIT_REPO}/sboms/petclinic/${{ github.sha }}/" --flat=true
+          jf rt u "target/bom.json" "${JF_GENERIC_AUDIT_REPO}/sboms/petclinic/${{ github.sha }}/" --flat=true
 
   docker_image:
     name: Build & Push Docker image (requires approval)
