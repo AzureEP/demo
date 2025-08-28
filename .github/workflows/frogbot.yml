@@ -18,6 +18,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Run Frogbot (non-blocking)
+        run: chmod +x ./gradlew
+        
+      - name: Run Frogbot (non-blocking)
         uses: jfrog/frogbot@v2
         continue-on-error: true
         env:
