@@ -47,7 +47,7 @@ jobs:
 
       - name: Generate CycloneDX SBOM (JSON)
         run: |
-          mvn org.cyclonedx:cyclonedx-maven-plugin:2.7.9:makeAggregateBom \
+          mvn org.cyclonedx:cyclonedx-maven-plugin:2.7.9:makeBom \
             -Dcyclonedx.outputFormat=json \
             -Dcyclonedx.outputName=cyclonedx
           test -f target/cyclonedx.json && ls -lh target/cyclonedx.json
