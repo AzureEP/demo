@@ -47,10 +47,10 @@ jobs:
 
       - name: Generate CycloneDX SBOM (JSON)
         run: |
-          mvn -q org.cyclonedx:cyclonedx-maven-plugin:2.7.9:makeAggregateBom \
+          mvn org.cyclonedx:cyclonedx-maven-plugin:2.7.9:makeBom \
             -Dcyclonedx.outputFormat=json \
-            -Dcyclonedx.outputName=cyclonedx
-          test -f target/cyclonedx.json && ls -lh target/cyclonedx.json
+            -Dcyclonedx.outputName=bom
+          test -f target/bom.json && ls -lh target/bom.json
 
       - name: Stage app.jar for downstream job
         run: |
@@ -70,7 +70,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: sbom-${{ github.sha }}
-          path: target/cyclonedx.json
+          path: target/bom.json
           if-no-files-found: error
           retention-days: 7
 
@@ -139,7 +139,7 @@ jobs:
       - name: Upload SBOM to generic audit repo
         if: github.event_name == 'push'
         run: |
-          jf rt u "target/cyclonedx.json" "${JF_GENERIC_AUDIT_REPO}/sboms/petclinic/${{ github.sha }}/" --flat=true
+          jf rt u "target/bom.json" "${JF_GENERIC_AUDIT_REPO}/sboms/petclinic/${{ github.sha }}/" --flat=true
 
   docker_image:
     name: Build & Push Docker image (requires approval)
