@@ -49,8 +49,8 @@ jobs:
         run: |
           mvn org.cyclonedx:cyclonedx-maven-plugin:2.7.9:makeBom \
             -Dcyclonedx.outputFormat=json \
-            -Dcyclonedx.outputName=cyclonedx
-          test -f target/cyclonedx.json && ls -lh target/cyclonedx.json
+            -Dcyclonedx.outputName=bom
+          test -f target/bom.json && ls -lh target/bom.json
 
       - name: Stage app.jar for downstream job
         run: |
