@@ -1,16 +1,18 @@
 # .github/workflows/02-docker-from-jar-dev.yml
-# Build a Docker image from the JAR artifact and push to Dev; Xray image scan (non-blocking).
+# Build Docker image from the JAR published by Step-01, push to DEV/quarantine,
+# capture image digest, fetch Xray registry scan summary by digest (non-blocking),
+# and upload mapping + report artifacts for later promotion.
 
 name: 02 — Docker from JAR (dev)
 
 on:
   workflow_run:
-    workflows: ["Build and Publish to JFrog Artifactory (with non-blocking Xray)"]   # Make sure this EXACTLY matches your Step-01 workflow name
+    workflows: ["Build and Publish to JFrog Artifactory (with non-blocking Xray)"]
     types: [completed]
   workflow_dispatch:
     inputs:
       commit:
-        description: "Commit SHA to package (defaults to triggering run)"
+        description: "Commit SHA to package (defaults to the triggering run)"
         required: false
 
 permissions:
@@ -22,15 +24,16 @@ jobs:
     timeout-minutes: 30
 
     env:
-      # JFrog settings (set in Repo → Settings → Variables)
-      JF_URL:              ${{ vars.JF_URL }}                 # e.g., https://chirag095.jfrog.io
-      JF_DOCKER_REGISTRY:  ${{ vars.JF_DOCKER_REGISTRY }}     # e.g., chirag095.jfrog.io
-      DOCKER_DEV_REPO:     ${{ vars.DOCKER_DEV_REPO }}        # e.g., petclinic-demo
-      IMAGE_NAME:          ${{ vars.IMAGE_NAME }}             # e.g., spring-petclinic (can be empty → defaulted)
+      # JFrog variables (Repository → Settings → Variables)
+      JF_URL:                 ${{ vars.JF_URL }}                 # e.g. https://chirag095.jfrog.io
+      JF_DOCKER_REGISTRY:     ${{ vars.JF_DOCKER_REGISTRY }}     # e.g. chirag095.jfrog.io
+      DOCKER_DEV_REPO:        ${{ vars.DOCKER_DEV_REPO }}        # e.g. petclinic-demo
+      IMAGE_NAME:             ${{ vars.IMAGE_NAME }}             # e.g. spring-petclinic
+      JF_MVN_SNAPSHOTS_REPO:  ${{ vars.JF_MVN_SNAPSHOTS_REPO }}  # only used for fallback logic (disabled here)
 
       # Secrets
-      JFROG_USER:          ${{ secrets.JFROG_USER }}
-      JFROG_TOKEN:         ${{ secrets.JFROG_TOKEN }}
+      JFROG_USER:  ${{ secrets.JFROG_USER }}
+      JFROG_TOKEN: ${{ secrets.JFROG_TOKEN }}
 
     steps:
       - name: Checkout
@@ -47,16 +50,15 @@ jobs:
           else
             SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
           fi
-          SHORT="${SHA::7}"
           echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
-          echo "short=${SHORT}" >> "$GITHUB_OUTPUT"
+          echo "short=${SHA::7}" >> "$GITHUB_OUTPUT"
 
-      # Download artifacts from Step-01 run, if present
-      - name: Download JAR artifact from Step-01
+      # Download ALL artifacts from Step-01 run (includes the remote-named JAR bundle)
+      - name: Download artifacts from Step-01
         if: ${{ github.event_name == 'workflow_run' }}
         uses: dawidd6/action-download-artifact@v6
         with:
-          workflow: 01 — Build & Publish JAR
+          workflow: "Build and Publish to JFrog Artifactory (with non-blocking Xray)"
           run_id: ${{ github.event.workflow_run.id }}
           path: ./inbox
 
@@ -65,7 +67,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ./inbox
-          echo "Listing downloaded artifacts (if any):"
+          echo "Downloaded artifacts (if any):"
           find ./inbox -maxdepth 3 -type f -print | sed 's/^/ - /' || true
 
       - name: Prepare app.jar
@@ -74,7 +76,7 @@ jobs:
           set -euo pipefail
           JAR=$(find ./inbox -type f -name "*.jar" | head -n1 || true)
           if [ -z "${JAR}" ]; then
-            echo "::error::No JAR found under ./inbox. Make sure Step-01 uploaded a JAR artifact."
+            echo "::error::No JAR found under ./inbox. Ensure Step-01 uploads a JAR artifact (remote-named bundle)."
             exit 1
           fi
           cp "$JAR" app.jar
@@ -87,10 +89,9 @@ jobs:
           set -euo pipefail
           IMG="${IMAGE_NAME:-}"
           if [ -z "$IMG" ]; then
-            echo "IMAGE_NAME not set; defaulting to 'spring-petclinic'"
             IMG="spring-petclinic"
+            echo "IMAGE_NAME not set; defaulting to '$IMG'"
           fi
-          # Enforce Docker name rules: lowercase, digits, separators . _ -
           if ! echo "$IMG" | grep -Eq '^[a-z0-9]+([._-][a-z0-9]+)*$'; then
             echo "::error::IMAGE_NAME '$IMG' is invalid. Use lowercase letters, digits, and separators . _ -"
             exit 1
@@ -107,16 +108,18 @@ jobs:
           username: ${{ env.JFROG_USER }}
           password: ${{ env.JFROG_TOKEN }}
 
-      - name: Build & push image (dev) — from app.jar
+      - name: Build & push image (dev/quarantine) — from app.jar
         id: buildpush
         shell: bash
         run: |
           set -euo pipefail
-          TAG1="${JF_DOCKER_REGISTRY}/${DOCKER_DEV_REPO}/${IMAGE_NAME}:git-${{ steps.src.outputs.short }}"
-          TAG2="${JF_DOCKER_REGISTRY}/${DOCKER_DEV_REPO}/${IMAGE_NAME}:${GITHUB_REF_NAME}-latest"
+          TAG_DEV="git-${{ steps.src.outputs.short }}"
+          TAG_LATEST="${GITHUB_REF_NAME}-latest"
+          FQ1="${JF_DOCKER_REGISTRY}/${DOCKER_DEV_REPO}/${IMAGE_NAME}:${TAG_DEV}"
+          FQ2="${JF_DOCKER_REGISTRY}/${DOCKER_DEV_REPO}/${IMAGE_NAME}:${TAG_LATEST}"
           echo "Using tags:"
-          echo " - $TAG1"
-          echo " - $TAG2"
+          echo " - $FQ1"
+          echo " - $FQ2"
 
           docker buildx build \
             --platform linux/amd64 \
@@ -124,52 +127,104 @@ jobs:
             --build-arg BUILD_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --build-arg VCS_REF="${{ steps.src.outputs.sha }}" \
             --build-arg REPO_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
-            -t "$TAG1" -t "$TAG2" \
+            -t "$FQ1" -t "$FQ2" \
             --push .
 
-          echo "tag1=$TAG1" >> "$GITHUB_OUTPUT"
-          echo "tag2=$TAG2" >> "$GITHUB_OUTPUT"
+          echo "tag1=$FQ1" >> "$GITHUB_OUTPUT"
+          echo "tag2=$FQ2" >> "$GITHUB_OUTPUT"
+          echo "tag_dev=${TAG_DEV}" >> "$GITHUB_OUTPUT"
 
-      # Optional: Xray image scan (non-blocking). Keep if you want the report here too.
-      - name: Install JFrog CLI
-        uses: jfrog/setup-jfrog-cli@v4
-      - name: Configure JFrog CLI server
+      # Capture the image digest from Artifactory (v2 manifest HEAD)
+      - name: Get image digest (Docker-Content-Digest)
+        id: digest
         shell: bash
         run: |
           set -euo pipefail
-          jf c add art --interactive=false --url "${JF_URL}" \
-            --user "${JFROG_USER}" --password "${JFROG_TOKEN}" --overwrite=true
-          jf c use art
-      - name: Xray image scan (non-blocking, save JSON)
+          NAME="${IMAGE_NAME}"
+          TAG="${{ steps.buildpush.outputs.tag_dev }}"
+          # Artifactory v2 manifest endpoint for a Docker repo:
+          URL="${JF_URL%/}/artifactory/api/docker/${DOCKER_DEV_REPO}/v2/${NAME}/manifests/${TAG}"
+          echo "Resolving digest via: $URL"
+          DIGEST=""
+          for i in 1 2 3 4 5; do
+            HDRS=$(curl -sSI -u "${JFROG_USER}:${JFROG_TOKEN}" \
+              -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+              "$URL" || true)
+            CODE=$(echo "$HDRS" | tr -d '\r' | awk 'NR==1{print $2}')
+            echo "HTTP $CODE (attempt $i)"
+            [ "$CODE" = "200" ] || { sleep 2; continue; }
+            DIGEST=$(echo "$HDRS" | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' | tail -n1)
+            [ -n "$DIGEST" ] && break
+            sleep 2
+          done
+          [ -n "$DIGEST" ] || { echo "::error::Could not resolve Docker-Content-Digest"; exit 1; }
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Resolved digest: $DIGEST"
+
+      # Ask Xray for the registry scan summary by digest (non-blocking)
+      - name: Fetch Xray registry scan summary (by digest) — non-blocking
+        id: xray
+        shell: bash
         continue-on-error: true
+        run: |
+          set -euo pipefail
+          DIGEST="${{ steps.digest.outputs.digest }}"
+          NAME="${IMAGE_NAME}"
+          COMP_ID="docker://${DOCKER_DEV_REPO}/${NAME}@${DIGEST}"
+          OUT="xray-image-summary.json"
+          echo "Querying Xray for component: $COMP_ID"
+          # Components summary API
+          CODE=$(curl -sS -u "${JFROG_USER}:${JFROG_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -o "$OUT" -w "%{http_code}" \
+            -X POST "${JF_URL%/}/xray/api/v1/summary/components" \
+            -d "{\"components\":[{\"component_id\":\"${COMP_ID}\"}]}" || true)
+          echo "Xray summary HTTP $CODE (saved to $OUT)"
+          if [ "$CODE" != "200" ]; then
+            echo "Xray summary not ready/available yet (HTTP $CODE). Keeping pipeline green on dev."
+          fi
+
+      - name: Write image mapping (commit ↔ tag ↔ digest)
+        id: mapping
         shell: bash
         run: |
           set -euo pipefail
-          IMG="${{ steps.buildpush.outputs.tag1 }}"
-          echo "Scanning $IMG"
-          if jf docker scan --help >/dev/null 2>&1; then
-            jf docker scan "$IMG" --format=json > xray-image.json || true
-          else
-            jf scan "$IMG" --format=json > xray-image.json || true
-          fi
-          echo "Saved xray-image.json"
+          cat > image-mapping.json <<EOF
+          {
+            "commit": "${{ steps.src.outputs.sha }}",
+            "image": {
+              "registry": "${{ env.JF_DOCKER_REGISTRY }}",
+              "repo": "${{ env.DOCKER_DEV_REPO }}",
+              "name": "${{ env.IMAGE_NAME }}",
+              "tag_git": "git-${{ steps.src.outputs.short }}",
+              "tag_branch_latest": "${GITHUB_REF_NAME}-latest",
+              "digest": "${{ steps.digest.outputs.digest }}"
+            },
+            "created_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+          cat image-mapping.json
 
-      - name: Upload scan report
+      - name: Upload mapping + Xray summary
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: xray-image-${{ steps.src.outputs.short }}
-          path: xray-image.json
+          name: image-dev-${{ steps.src.outputs.short }}
+          path: |
+            image-mapping.json
+            xray-image-summary.json
           if-no-files-found: warn
 
       - name: Summary
         shell: bash
         run: |
           {
-            echo "### Dev image built from JAR"
+            echo "### Dev image pushed to quarantine"
             echo "- Commit: \`${{ steps.src.outputs.sha }}\`"
-            echo "- Tags:"
-            echo "  - \`${{ steps.buildpush.outputs.tag1 }}\`"
-            echo "  - \`${{ steps.buildpush.outputs.tag2 }}\`"
-            echo "- Xray image report (optional): \`xray-image.json\`"
+            echo "- Tag: \`${{ steps.buildpush.outputs.tag1 }}\`"
+            echo "- Digest: \`${{ steps.digest.outputs.digest }}\`"
+            echo "- Mapping file: \`image-mapping.json\` (uploaded)"
+            echo "- Xray summary: \`xray-image-summary.json\` (non-blocking; uploaded)"
+            echo ""
+            echo "_Promotion workflow can now use **image-mapping.json** (digest) and enforce hard gates in prod._"
           } >> "$GITHUB_STEP_SUMMARY"
